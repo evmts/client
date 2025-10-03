@@ -1,0 +1,6 @@
+[submodule "guillotine"]
+	path = guillotine
+	url = https://github.com/evmts/guillotine
+[submodule "libmdbx"]
+	path = libmdbx
+	url = https://github.com/erthink/libmdbx

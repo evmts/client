@@ -103,7 +103,7 @@ const ExpHeap = struct {
 
     fn init(allocator: std.mem.Allocator) ExpHeap {
         return .{
-            .items = std.ArrayList(ExpItem).init(allocator),
+            .items = std.ArrayList(ExpItem){},
             .allocator = allocator,
         };
     }
@@ -112,12 +112,12 @@ const ExpHeap = struct {
         for (self.items.items) |item| {
             self.allocator.free(item.item);
         }
-        self.items.deinit();
+        self.items.deinit(self.allocator);
     }
 
     fn add(self: *ExpHeap, item: []const u8, exp_time: i64) !void {
         const owned = try self.allocator.dupe(u8, item);
-        try self.items.append(.{ .item = owned, .exp_time = exp_time });
+        try self.items.append(self.allocator, .{ .item = owned, .exp_time = exp_time });
         self.siftUp(self.items.items.len - 1);
     }
 
@@ -321,11 +321,11 @@ pub const Server = struct {
             .listen_thread = null,
             .dialsched_thread = null,
             .quit = std.atomic.Value(bool).init(false),
-            .add_trusted_queue = std.ArrayList(discovery.Node).init(allocator),
-            .remove_trusted_queue = std.ArrayList(discovery.Node).init(allocator),
-            .checkpoint_post_handshake_queue = std.ArrayList(CheckpointMsg).init(allocator),
-            .checkpoint_add_peer_queue = std.ArrayList(CheckpointMsg).init(allocator),
-            .del_peer_queue = std.ArrayList(PeerDrop).init(allocator),
+            .add_trusted_queue = std.ArrayList(discovery.Node){},
+            .remove_trusted_queue = std.ArrayList(discovery.Node){},
+            .checkpoint_post_handshake_queue = std.ArrayList(CheckpointMsg){},
+            .checkpoint_add_peer_queue = std.ArrayList(CheckpointMsg){},
+            .del_peer_queue = std.ArrayList(PeerDrop){},
             .add_trusted_mutex = .{},
             .remove_trusted_mutex = .{},
             .checkpoint_post_mutex = .{},
@@ -370,11 +370,11 @@ pub const Server = struct {
         self.history_mutex.unlock();
 
         // Clean up queues
-        self.add_trusted_queue.deinit();
-        self.remove_trusted_queue.deinit();
-        self.checkpoint_post_handshake_queue.deinit();
-        self.checkpoint_add_peer_queue.deinit();
-        self.del_peer_queue.deinit();
+        self.add_trusted_queue.deinit(self.allocator);
+        self.remove_trusted_queue.deinit(self.allocator);
+        self.checkpoint_post_handshake_queue.deinit(self.allocator);
+        self.checkpoint_add_peer_queue.deinit(self.allocator);
+        self.del_peer_queue.deinit(self.allocator);
 
         self.allocator.destroy(self);
     }

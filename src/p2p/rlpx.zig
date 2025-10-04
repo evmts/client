@@ -3,23 +3,66 @@
 //!
 //! RLPx is the encrypted transport protocol for Ethereum P2P.
 //! Spec: https://github.com/ethereum/devp2p/blob/master/rlpx.md
+//!
+//! Protocol overview:
+//! 1. ECIES handshake to establish shared secrets (EIP-8 format)
+//! 2. Derive AES and MAC keys from ECDH ephemeral shared secret
+//! 3. Frame-based message protocol with AES-CTR encryption
+//! 4. Each frame: [header(16)+headerMAC(16)][frameData(padded)+frameMAC(16)]
+//! 5. Optional snappy compression after Hello exchange
 
 const std = @import("std");
-const crypto = @import("crypto");
-const primitives = @import("primitives");
-const rlp = primitives.rlp;
+const net = std.net;
+const crypto = std.crypto;
+const Allocator = std.mem.Allocator;
 
-/// RLPx connection wrapping a TCP socket
+// Import snappy compression (vendored)
+const snappy = @import("snappy.zig");
+
+// Import guillotine crypto primitives for secp256k1 operations
+const guillotine = @import("guillotine");
+const secp256k1 = guillotine.crypto.secp256k1;
+
+// Constants
+const maxUint24: u32 = 0xFFFFFF;
+const eciesOverhead: usize = 65 + 16 + 32; // pubkey + IV + MAC
+const zeroHeader = [_]u8{ 0xC2, 0x80, 0x80 }; // RLP empty list format
+
+/// Errors that can occur during RLPx operations
+pub const Error = error{
+    NoSession,
+    NoCipher,
+    IncompleteFrame,
+    InvalidHeaderMAC,
+    InvalidFrameMAC,
+    InvalidAuthMessage,
+    InvalidAckMessage,
+    MessageTooLarge,
+    HandshakeFailed,
+    InvalidPublicKey,
+    InvalidPrivateKey,
+    ECDHFailed,
+    OutOfMemory,
+    ConnectionClosed,
+    IOError,
+    CompressionFailed,
+    DecompressionFailed,
+    DecompressedTooLarge,
+};
+
+/// RLPx connection wrapping a TCP stream
 pub const Conn = struct {
-    allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    allocator: Allocator,
+    stream: net.Stream,
     session: ?*SessionState,
-    dial_dest: ?[]const u8, // Remote public key if initiator
+    dial_dest: ?[64]u8, // Remote public key (64 bytes uncompressed)
     snappy_enabled: bool,
 
     const Self = @This();
 
-    pub fn init(allocator: std.mem.Allocator, stream: std.net.Stream, dial_dest: ?[]const u8) Self {
+    /// Create a new RLPx connection
+    /// dial_dest should be the remote node's 64-byte public key if we are the initiator
+    pub fn init(allocator: Allocator, stream: net.Stream, dial_dest: ?[64]u8) Self {
         return .{
             .allocator = allocator,
             .stream = stream,
@@ -37,616 +80,674 @@ pub const Conn = struct {
         self.stream.close();
     }
 
-    /// Perform RLPx handshake
-    pub fn handshake(self: *Self, priv_key: []const u8) !void {
-        if (self.dial_dest) |remote_pub| {
-            // Initiator side
-            try self.initiatorHandshake(priv_key, remote_pub);
-        } else {
-            // Receiver side
-            try self.receiverHandshake(priv_key);
-        }
-    }
+    /// Perform the RLPx encryption handshake
+    /// priv_key: Our 32-byte private key
+    /// Returns the remote peer's public key on success
+    pub fn handshake(self: *Self, priv_key: [32]u8) ![64]u8 {
+        var handshake_state = HandshakeState.init(self.allocator);
+        defer handshake_state.deinit();
 
-    /// Initiator handshake (we are dialing out)
-    fn initiatorHandshake(self: *Self, priv_key: []const u8, remote_pub: []const u8) !void {
-        // 1. Generate ephemeral key pair
-        var ephemeral_priv: [32]u8 = undefined;
-        try std.crypto.random.bytes(&ephemeral_priv);
+        const secrets = if (self.dial_dest) |remote_pub|
+            try handshake_state.runInitiator(&self.stream, priv_key, remote_pub)
+        else
+            try handshake_state.runRecipient(&self.stream, priv_key);
 
-        // 2. Derive shared secret using ECDH
-        const shared_secret = try ecdhSharedSecret(priv_key, remote_pub);
-
-        // 3. Send auth message
-        const auth_msg = try self.makeAuthMsg(priv_key, &ephemeral_priv, remote_pub, &shared_secret);
-        defer self.allocator.free(auth_msg);
-
-        try self.stream.writeAll(auth_msg);
-
-        // 4. Receive auth-ack message
-        var ack_buf: [307]u8 = undefined; // Auth-ack size
-        const ack_len = try self.stream.read(&ack_buf);
-        const ack_msg = ack_buf[0..ack_len];
-
-        // 5. Decrypt and process ack
-        const remote_ephemeral_pub = try self.processAuthAck(ack_msg, &shared_secret);
-
-        // 6. Derive session secrets
+        // Initialize session with derived secrets
         self.session = try self.allocator.create(SessionState);
-        try self.session.?.initFromHandshake(
-            self.allocator,
-            &ephemeral_priv,
-            remote_ephemeral_pub,
-            &shared_secret,
-            true, // initiator
-        );
+        errdefer self.allocator.destroy(self.session.?);
+
+        try self.session.?.init(self.allocator, secrets);
+
+        return secrets.remote_pubkey;
     }
 
-    /// Receiver handshake (we received incoming connection)
-    fn receiverHandshake(self: *Self, priv_key: []const u8) !void {
-        // 1. Receive auth message
-        var auth_buf: [307]u8 = undefined; // Auth message size
-        const auth_len = try self.stream.read(&auth_buf);
-        const auth_msg = auth_buf[0..auth_len];
-
-        // 2. Process auth and extract initiator info
-        const initiator_info = try self.processAuth(auth_msg, priv_key);
-        defer self.allocator.free(initiator_info.ephemeral_pub);
-
-        // 3. Generate our ephemeral key
-        var ephemeral_priv: [32]u8 = undefined;
-        try std.crypto.random.bytes(&ephemeral_priv);
-
-        // 4. Send auth-ack
-        const ack_msg = try self.makeAuthAck(&ephemeral_priv, initiator_info.shared_secret);
-        defer self.allocator.free(ack_msg);
-
-        try self.stream.writeAll(ack_msg);
-
-        // 5. Derive session secrets
-        self.session = try self.allocator.create(SessionState);
-        try self.session.?.initFromHandshake(
-            self.allocator,
-            &ephemeral_priv,
-            initiator_info.ephemeral_pub,
-            initiator_info.shared_secret,
-            false, // receiver
-        );
-    }
-
-    /// Read a message from the connection
-    pub fn readMsg(self: *Self) !Message {
-        if (self.session == null) return error.NoSession;
-
-        const frame = try self.session.?.readFrame(&self.stream);
-        defer self.allocator.free(frame);
-
-        // Decode message code and payload
-        var decoder = rlp.Decoder.init(frame);
-        const code = try decoder.decodeInt();
-        const payload = try decoder.decodeBytesView();
-
-        // Decompress if snappy enabled
-        const final_payload = payload;
-        if (self.snappy_enabled) {
-            // TODO: Snappy decompression
-            // For now, just use raw payload
-        }
-
-        return Message{
-            .code = code,
-            .payload = try self.allocator.dupe(u8, final_payload),
-        };
-    }
-
-    /// Write a message to the connection
-    pub fn writeMsg(self: *Self, code: u64, payload: []const u8) !void {
-        if (self.session == null) return error.NoSession;
-
-        // Compress if snappy enabled
-        const final_payload = payload;
-        if (self.snappy_enabled) {
-            // TODO: Snappy compression
-        }
-
-        // Encode message
-        var encoder = rlp.Encoder.init(self.allocator);
-        defer encoder.deinit();
-
-        try encoder.writeInt(code);
-        try encoder.writeBytes(final_payload);
-        const encoded = try encoder.toOwnedSlice();
-        defer self.allocator.free(encoded);
-
-        // Write frame
-        try self.session.?.writeFrame(&self.stream, encoded);
-    }
-
+    /// Enable or disable snappy compression
     pub fn setSnappy(self: *Self, enabled: bool) void {
         self.snappy_enabled = enabled;
     }
 
-    // Helper functions
-    fn makeAuthMsg(self: *Self, priv_key: []const u8, ephemeral_priv: []const u8, remote_pub: []const u8, shared_secret: []const u8) ![]u8 {
-        // Create auth message according to RLPx spec
-        // auth = E(remote-pubk, S(ephemeral-privk, shared-secret ^ nonce) || H(ephemeral-pubk) || pubk || nonce || 0x0)
+    /// Read a message from the connection
+    /// Returns: (message_code, payload_data, wire_size)
+    /// The payload buffer is owned by the caller and must be freed
+    pub fn readMsg(self: *Self) !struct { code: u64, data: []u8, wireSize: usize } {
+        const session = self.session orelse return Error.NoSession;
 
-        var nonce: [32]u8 = undefined;
-        try std.crypto.random.bytes(&nonce);
+        // Read encrypted frame
+        const frame = try session.readFrame(&self.stream);
+        defer self.allocator.free(frame);
 
-        // Derive ephemeral public key
-        const ephemeral_d = std.mem.readInt(u256, ephemeral_priv[0..32], .big);
-        const ephemeral_pub_point = crypto.AffinePoint.generator().scalar_mul(ephemeral_d);
-        var ephemeral_pub: [64]u8 = undefined;
-        std.mem.writeInt(u256, ephemeral_pub[0..32], ephemeral_pub_point.x, .big);
-        std.mem.writeInt(u256, ephemeral_pub[32..64], ephemeral_pub_point.y, .big);
+        // Decode RLP: [code, data]
+        if (frame.len == 0) return Error.InvalidFrameMAC;
 
-        // XOR shared secret with nonce for signature
-        var sig_msg: [32]u8 = undefined;
-        for (shared_secret[0..32], nonce, 0..) |s, n, i| {
-            sig_msg[i] = s ^ n;
+        // First byte is code as single-byte RLP or RLP encoded
+        var pos: usize = 0;
+        const code: u64 = blk: {
+            if (frame[0] < 0x80) {
+                // Single byte value
+                pos = 1;
+                break :blk frame[0];
+            } else if (frame[0] < 0xB8) {
+                // Short string encoding
+                const len = frame[0] - 0x80;
+                if (len == 0) break :blk 0;
+                if (len > 8) return error.InvalidMessage;
+                var val: u64 = 0;
+                pos = 1 + len;
+                for (frame[1..pos]) |b| {
+                    val = (val << 8) | b;
+                }
+                break :blk val;
+            } else {
+                return error.InvalidMessage;
+            }
+        };
+
+        var data = frame[pos..];
+        const wireSize = data.len;
+
+        // Decompress if snappy is enabled
+        // This matches Erigon's implementation (rlpx.go:150-163)
+        var decompressed_data: ?[]u8 = null;
+        if (self.snappy_enabled and data.len > 0) {
+            // Decode the snappy-compressed data
+            decompressed_data = snappy.decode(self.allocator, data) catch |err| {
+                std.debug.print("Snappy decompression failed: {}\n", .{err});
+                return Error.DecompressionFailed;
+            };
+
+            // Validate decompressed size doesn't exceed max
+            if (decompressed_data.?.len > maxUint24) {
+                self.allocator.free(decompressed_data.?);
+                return Error.DecompressedTooLarge;
+            }
+
+            data = decompressed_data.?;
         }
 
-        // Sign with our private key (simplified - should use proper ECDSA)
-        const sig_hash = crypto.keccak256(&sig_msg);
+        // Allocate and copy payload for caller
+        const payload = try self.allocator.dupe(u8, data);
 
-        // Build auth message: signature(65) + H(ephemeral-pubk)(32) + pubk(64) + nonce(32) + version(1)
-        var auth_plain = try self.allocator.alloc(u8, 65 + 32 + 64 + 32 + 1);
-        defer self.allocator.free(auth_plain);
+        // Free decompressed buffer if we created one
+        if (decompressed_data) |decompressed| {
+            self.allocator.free(decompressed);
+        }
 
-        // Signature placeholder (would need proper signing)
-        @memset(auth_plain[0..65], 0);
-        @memcpy(auth_plain[0..32], &sig_hash); // Use hash as placeholder
-
-        // Keccak256(ephemeral_pub)
-        const eph_hash = crypto.keccak256(&ephemeral_pub);
-        @memcpy(auth_plain[65..97], &eph_hash);
-
-        // Our public key (derive from priv_key)
-        const our_d = std.mem.readInt(u256, priv_key[0..32], .big);
-        const our_pub_point = crypto.AffinePoint.generator().scalar_mul(our_d);
-        std.mem.writeInt(u256, auth_plain[97..129], our_pub_point.x, .big);
-        std.mem.writeInt(u256, auth_plain[129..161], our_pub_point.y, .big);
-
-        // Nonce
-        @memcpy(auth_plain[161..193], &nonce);
-
-        // Version (0x04 for v4)
-        auth_plain[193] = 0x04;
-
-        // Encrypt with ECIES using remote public key
-        var remote_pub_fixed: [64]u8 = undefined;
-        @memcpy(&remote_pub_fixed, remote_pub[0..64]);
-
-        return try crypto.ECIES.encrypt(self.allocator, remote_pub_fixed, auth_plain, null);
+        return .{ .code = code, .data = payload, .wireSize = wireSize };
     }
 
-    fn processAuth(self: *Self, auth_msg: []const u8, priv_key: []const u8) !InitiatorInfo {
-        // Decrypt auth message using our private key
-        var priv_key_fixed: [32]u8 = undefined;
-        @memcpy(&priv_key_fixed, priv_key[0..32]);
+    /// Write a message to the connection
+    /// Returns the wire size (may be compressed)
+    pub fn writeMsg(self: *Self, code: u64, payload: []const u8) !u32 {
+        const session = self.session orelse return Error.NoSession;
 
-        const auth_plain = try crypto.ECIES.decrypt(self.allocator, priv_key_fixed, auth_msg, null);
-        defer self.allocator.free(auth_plain);
+        if (payload.len > maxUint24) return Error.MessageTooLarge;
 
-        if (auth_plain.len < 194) return error.InvalidAuthMessage;
+        // Compress if snappy is enabled
+        // This matches Erigon's implementation (rlpx.go:222-228)
+        var compressed_data: ?[]u8 = null;
+        var data = payload;
 
-        // Parse auth message components
-        // signature(65) + H(ephemeral-pubk)(32) + pubk(64) + nonce(32) + version(1)
-
-        // Extract initiator public key
-        var initiator_pub: [64]u8 = undefined;
-        @memcpy(&initiator_pub, auth_plain[97..161]);
-
-        // Extract nonce
-        var initiator_nonce: [32]u8 = undefined;
-        @memcpy(&initiator_nonce, auth_plain[161..193]);
-
-        // Derive shared secret using ECDH
-        const shared_secret = try crypto.ECIES.generateShared(priv_key_fixed, initiator_pub);
-
-        // Store ephemeral public key (extracted from signature verification - simplified here)
-        const ephemeral_pub = try self.allocator.alloc(u8, 64);
-        @memset(ephemeral_pub, 0); // Placeholder
-
-        // Store shared secret
-        const shared_copy = try self.allocator.alloc(u8, 32);
-        @memcpy(shared_copy, &shared_secret);
-
-        return InitiatorInfo{
-            .ephemeral_pub = ephemeral_pub,
-            .shared_secret = shared_copy,
+        if (self.snappy_enabled) {
+            // Encode the data with snappy compression
+            compressed_data = snappy.encode(self.allocator, @constCast(payload)) catch |err| {
+                std.debug.print("Snappy compression failed: {}\n", .{err});
+                return Error.CompressionFailed;
+            };
+            data = compressed_data.?;
+        }
+        defer if (compressed_data) |compressed| {
+            self.allocator.free(compressed);
         };
-    }
 
-    fn makeAuthAck(self: *Self, ephemeral_priv: []const u8, _: []const u8) ![]u8 {
-        // Create auth-ack message according to RLPx spec
-        // auth-ack = E(remote-pubk, remote-ephemeral-pubk || nonce || 0x0)
+        const wireSize: u32 = @intCast(data.len);
 
-        var nonce: [32]u8 = undefined;
-        try std.crypto.random.bytes(&nonce);
+        // Encode as RLP: [code, data]
+        var encoded = std.ArrayList(u8).init(self.allocator);
+        defer encoded.deinit();
 
-        // Derive our ephemeral public key
-        const ephemeral_d = std.mem.readInt(u256, ephemeral_priv[0..32], .big);
-        const ephemeral_pub_point = crypto.AffinePoint.generator().scalar_mul(ephemeral_d);
+        // Encode code
+        if (code == 0) {
+            try encoded.append(0x80); // Empty string
+        } else if (code < 0x80) {
+            try encoded.append(@intCast(code));
+        } else if (code < 0x100) {
+            try encoded.append(0x81);
+            try encoded.append(@intCast(code));
+        } else {
+            // Multi-byte encoding
+            var temp: [8]u8 = undefined;
+            var len: usize = 0;
+            var val = code;
+            while (val > 0) : (len += 1) {
+                temp[7 - len] = @intCast(val & 0xFF);
+                val >>= 8;
+            }
+            try encoded.append(0x80 + @as(u8, @intCast(len)));
+            try encoded.appendSlice(temp[8 - len ..]);
+        }
 
-        // Build ack message: ephemeral-pubk(64) + nonce(32) + version(1)
-        var ack_plain = try self.allocator.alloc(u8, 64 + 32 + 1);
-        defer self.allocator.free(ack_plain);
+        // Append payload (compressed or not)
+        try encoded.appendSlice(data);
 
-        // Our ephemeral public key
-        std.mem.writeInt(u256, ack_plain[0..32], ephemeral_pub_point.x, .big);
-        std.mem.writeInt(u256, ack_plain[32..64], ephemeral_pub_point.y, .big);
+        // Write frame
+        try session.writeFrame(&self.stream, encoded.items);
 
-        // Nonce
-        @memcpy(ack_plain[64..96], &nonce);
-
-        // Version
-        ack_plain[96] = 0x04;
-
-        // Encrypt with ECIES
-        // Extract initiator public key from shared_secret context (simplified)
-        var remote_pub: [64]u8 = undefined;
-        @memset(&remote_pub, 0); // Placeholder - should extract from handshake state
-
-        return try crypto.ECIES.encrypt(self.allocator, remote_pub, ack_plain, null);
-    }
-
-    fn processAuthAck(self: *Self, ack_msg: []const u8, shared_secret: []const u8) ![]const u8 {
-        _ = shared_secret;
-
-        // Decrypt auth-ack using our private key (from dial_dest context)
-        var priv_key: [32]u8 = undefined;
-        try std.crypto.random.bytes(&priv_key); // Placeholder - should use actual priv key
-
-        const ack_plain = try crypto.ECIES.decrypt(self.allocator, priv_key, ack_msg, null);
-        defer self.allocator.free(ack_plain);
-
-        if (ack_plain.len < 97) return error.InvalidAckMessage;
-
-        // Extract remote ephemeral public key
-        const remote_ephemeral_pub = try self.allocator.alloc(u8, 64);
-        @memcpy(remote_ephemeral_pub, ack_plain[0..64]);
-
-        return remote_ephemeral_pub;
+        return wireSize;
     }
 };
 
-/// Session state containing encryption keys
+/// Session secrets derived from handshake
+const Secrets = struct {
+    remote_pubkey: [64]u8,
+    aes: [32]u8, // AES-256 key
+    mac: [16]u8, // MAC key (AES-128)
+    egress_mac: crypto.hash.sha3.Keccak256, // Egress MAC state
+    ingress_mac: crypto.hash.sha3.Keccak256, // Ingress MAC state
+};
+
+/// Encryption session state
 pub const SessionState = struct {
-    allocator: std.mem.Allocator,
-    enc_cipher: ?std.crypto.core.aes.Aes256, // Egress encryption
-    dec_cipher: ?std.crypto.core.aes.Aes256, // Ingress decryption
-    egress_mac: HashMAC,
-    ingress_mac: HashMAC,
-    read_buf: std.ArrayList(u8),
-    write_buf: std.ArrayList(u8),
+    allocator: Allocator,
+    enc_cipher: crypto.core.aes.Aes256, // Egress AES-256
+    dec_cipher: crypto.core.aes.Aes256, // Ingress AES-256
+    mac_cipher: crypto.core.aes.Aes128, // MAC encryption
+    egress_mac: crypto.hash.sha3.Keccak256,
+    ingress_mac: crypto.hash.sha3.Keccak256,
+    enc_ctr: [16]u8, // Encryption counter
+    dec_ctr: [16]u8, // Decryption counter
+    read_buf: ReadBuffer,
+    write_buf: WriteBuffer,
 
     const Self = @This();
 
-    pub fn deinit(self: *Self) void {
-        self.read_buf.deinit();
-        self.write_buf.deinit();
-    }
-
-    /// Initialize from handshake secrets
-    /// Based on erigon/p2p/rlpx/rlpx.go InitWithSecrets and secrets()
-    pub fn initFromHandshake(
-        self: *Self,
-        allocator: std.mem.Allocator,
-        ephemeral_priv: []const u8,
-        remote_ephemeral_pub: []const u8,
-        shared_secret: []const u8,
-        initiator: bool,
-    ) !void {
+    pub fn init(self: *Self, allocator: Allocator, secrets: Secrets) !void {
         self.allocator = allocator;
-        self.read_buf = std.ArrayList(u8).init(allocator);
-        self.write_buf = std.ArrayList(u8).init(allocator);
-
-        // Derive ECDH shared secret from ephemeral keys
-        var ecdh_secret: [32]u8 = undefined;
-        if (ephemeral_priv.len >= 32 and remote_ephemeral_pub.len >= 64) {
-            var priv_fixed: [32]u8 = undefined;
-            var pub_fixed: [64]u8 = undefined;
-            @memcpy(&priv_fixed, ephemeral_priv[0..32]);
-            @memcpy(&pub_fixed, remote_ephemeral_pub[0..64]);
-            ecdh_secret = try crypto.ECIES.generateShared(priv_fixed, pub_fixed);
-        } else {
-            // Fallback for testing
-            @memcpy(&ecdh_secret, shared_secret[0..32]);
-        }
-
-        // Derive session keys using Keccak256
-        // sharedSecret = keccak256(ecdh_secret || keccak256(respNonce || initNonce))
-        // aesSecret = keccak256(ecdh_secret || sharedSecret)
-        // macSecret = keccak256(ecdh_secret || aesSecret)
-
-        var nonce_hash: [32]u8 = undefined;
-        @memset(&nonce_hash, 0); // Simplified - should use actual nonces from handshake
-
-        var shared_hash_input: [64]u8 = undefined;
-        @memcpy(shared_hash_input[0..32], &ecdh_secret);
-        @memcpy(shared_hash_input[32..64], &nonce_hash);
-        const shared_hash = crypto.keccak256(&shared_hash_input);
-
-        var aes_input: [64]u8 = undefined;
-        @memcpy(aes_input[0..32], &ecdh_secret);
-        @memcpy(aes_input[32..64], &shared_hash);
-        const aes_secret = crypto.keccak256(&aes_input);
-
-        var mac_input: [64]u8 = undefined;
-        @memcpy(mac_input[0..32], &ecdh_secret);
-        @memcpy(mac_input[32..64], &aes_secret);
-        const mac_secret = crypto.keccak256(&mac_input);
-
-        // Initialize AES-CTR ciphers with same key for both directions
-        // (CTR mode uses encryption for both encrypt and decrypt)
-        self.enc_cipher = std.crypto.core.aes.Aes256.initEnc(aes_secret);
-        self.dec_cipher = std.crypto.core.aes.Aes256.initEnc(aes_secret);
-
-        // Initialize MACs
-        // mac1 = keccak256(mac_secret ^ respNonce || auth)
-        // mac2 = keccak256(mac_secret ^ initNonce || authResp)
-        var egress_init: [32]u8 = undefined;
-        var ingress_init: [32]u8 = undefined;
-
-        // XOR mac_secret with nonces (simplified)
-        for (mac_secret, 0..) |m, i| {
-            egress_init[i] = m ^ nonce_hash[i];
-            ingress_init[i] = m ^ nonce_hash[i];
-        }
-
-        if (initiator) {
-            self.egress_mac = HashMAC.init(mac_secret[0..16], &egress_init);
-            self.ingress_mac = HashMAC.init(mac_secret[0..16], &ingress_init);
-        } else {
-            self.egress_mac = HashMAC.init(mac_secret[0..16], &ingress_init);
-            self.ingress_mac = HashMAC.init(mac_secret[0..16], &egress_init);
-        }
+        self.enc_cipher = crypto.core.aes.Aes256.initEnc(secrets.aes);
+        self.dec_cipher = crypto.core.aes.Aes256.initEnc(secrets.aes); // CTR uses encrypt for both
+        self.mac_cipher = crypto.core.aes.Aes128.initEnc(secrets.mac);
+        self.egress_mac = secrets.egress_mac;
+        self.ingress_mac = secrets.ingress_mac;
+        @memset(&self.enc_ctr, 0);
+        @memset(&self.dec_ctr, 0);
+        self.read_buf = ReadBuffer.init();
+        self.write_buf = WriteBuffer.init();
     }
 
-    /// Read an RLPx frame
-    /// Based on erigon/p2p/rlpx/rlpx.go readFrame
-    pub fn readFrame(self: *Self, stream: *std.net.Stream) ![]u8 {
-        // Read frame header (16 bytes encrypted + 16 bytes MAC)
-        var header_buf: [32]u8 = undefined;
-        const header_len = try stream.read(&header_buf);
-        if (header_len < 32) return error.IncompleteFrame;
+    pub fn deinit(self: *Self) void {
+        self.read_buf.deinit(self.allocator);
+        self.write_buf.deinit(self.allocator);
+    }
 
-        // Verify header MAC using RLPx MAC construction
-        const want_header_mac = self.ingress_mac.computeHeader(header_buf[0..16]);
-        if (!std.mem.eql(u8, &want_header_mac, header_buf[16..32])) {
-            return error.InvalidHeaderMAC;
+    /// Read and decrypt a frame
+    pub fn readFrame(self: *Self, stream: *net.Stream) ![]u8 {
+        self.read_buf.reset();
+
+        // Read header (16 bytes encrypted + 16 bytes MAC)
+        const header_data = try self.read_buf.read(self.allocator, stream, 32);
+        const header_enc = header_data[0..16];
+        const header_mac = header_data[16..32];
+
+        // Verify header MAC
+        const want_mac = self.updateIngressMAC(header_enc);
+        if (!std.mem.eql(u8, &want_mac, header_mac)) {
+            return Error.InvalidHeaderMAC;
         }
 
-        // Decrypt header using AES-CTR
+        // Decrypt header
         var header_plain: [16]u8 = undefined;
-        if (self.dec_cipher) |cipher| {
-            // CTR mode XORs keystream with data
-            var counter: [16]u8 = undefined;
-            @memset(&counter, 0);
-            cipher.encrypt(&counter, &counter);
-            for (header_buf[0..16], &header_plain) |enc, *plain| {
-                plain.* = enc ^ counter[@intFromPtr(plain) % 16];
-            }
-        } else {
-            return error.NoCipher;
-        }
+        self.xorKeyStream(&self.dec_cipher, &self.dec_ctr, &header_plain, header_enc);
 
-        // Parse frame size from header (first 3 bytes, big-endian)
-        const frame_size = (@as(u32, header_plain[0]) << 16) |
-                          (@as(u32, header_plain[1]) << 8) |
-                          @as(u32, header_plain[2]);
+        // Parse frame size (first 3 bytes, big-endian)
+        const frame_size: u32 = (@as(u32, header_plain[0]) << 16) |
+            (@as(u32, header_plain[1]) << 8) |
+            @as(u32, header_plain[2]);
 
-        // Calculate padding (frame size must be multiple of 16)
+        // Calculate padded size (must be multiple of 16)
         const padding = if (frame_size % 16 == 0) @as(u32, 0) else 16 - (frame_size % 16);
-        const total_size = frame_size + padding;
+        const padded_size = frame_size + padding;
 
         // Read frame data + MAC
-        self.read_buf.clearRetainingCapacity();
-        try self.read_buf.resize(total_size + 16);
-        const data_len = try stream.read(self.read_buf.items);
-        if (data_len < total_size + 16) return error.IncompleteFrame;
+        const frame_data = try self.read_buf.read(self.allocator, stream, padded_size + 16);
+        const frame_enc = frame_data[0..padded_size];
+        const frame_mac = frame_data[padded_size .. padded_size + 16];
 
         // Verify frame MAC
-        const want_frame_mac = self.ingress_mac.computeFrame(self.read_buf.items[0..total_size]);
-        if (!std.mem.eql(u8, &want_frame_mac, self.read_buf.items[total_size..total_size+16])) {
-            return error.InvalidFrameMAC;
+        const want_frame_mac = self.updateIngressMACFrame(frame_enc);
+        if (!std.mem.eql(u8, &want_frame_mac, frame_mac)) {
+            return Error.InvalidFrameMAC;
         }
 
-        // Decrypt frame data using AES-CTR
-        var decrypted = try self.allocator.alloc(u8, frame_size);
-        if (self.dec_cipher) |cipher| {
-            var i: usize = 0;
-            while (i < total_size) : (i += 16) {
-                const block_end = @min(i + 16, total_size);
-                var counter: [16]u8 = undefined;
-                @memset(&counter, 0);
-                cipher.encrypt(&counter, &counter);
+        // Decrypt frame
+        const decrypted = try self.allocator.alloc(u8, frame_size);
+        errdefer self.allocator.free(decrypted);
 
-                for (self.read_buf.items[i..block_end], 0..) |enc, j| {
-                    if (i + j < frame_size) {
-                        decrypted[i + j] = enc ^ counter[j];
-                    }
-                }
-            }
-        }
+        self.xorKeyStream(&self.dec_cipher, &self.dec_ctr, decrypted, frame_enc[0..frame_size]);
 
-        return decrypted[0..frame_size];
+        return decrypted;
     }
 
-    /// Write an RLPx frame
-    /// Based on erigon/p2p/rlpx/rlpx.go writeFrame
-    pub fn writeFrame(self: *Self, stream: *std.net.Stream, data: []const u8) !void {
-        const frame_size = data.len;
-        const padding = if (frame_size % 16 == 0) @as(usize, 0) else 16 - (frame_size % 16);
-        const total_size = frame_size + padding;
+    /// Encrypt and write a frame
+    pub fn writeFrame(self: *Self, stream: *net.Stream, data: []const u8) !void {
+        const frame_size: u32 = @intCast(data.len);
+        if (frame_size > maxUint24) return Error.MessageTooLarge;
 
-        // Build header: 3 bytes size + 13 bytes protocol header
+        // Calculate padding
+        const padding = if (frame_size % 16 == 0) @as(usize, 0) else 16 - (frame_size % 16);
+        const padded_size = frame_size + padding;
+
+        self.write_buf.reset();
+
+        // Build and encrypt header
         var header: [16]u8 = undefined;
         header[0] = @intCast((frame_size >> 16) & 0xFF);
         header[1] = @intCast((frame_size >> 8) & 0xFF);
         header[2] = @intCast(frame_size & 0xFF);
-
-        // Protocol header (use zeroHeader pattern from Erigon: 0xC2, 0x80, 0x80)
-        header[3] = 0xC2;
-        header[4] = 0x80;
-        header[5] = 0x80;
+        @memcpy(header[3..6], &zeroHeader);
         @memset(header[6..16], 0);
 
-        // Encrypt header using AES-CTR
-        var header_encrypted: [16]u8 = undefined;
-        if (self.enc_cipher) |cipher| {
-            var counter: [16]u8 = undefined;
-            @memset(&counter, 0);
-            cipher.encrypt(&counter, &counter);
-            for (header, &header_encrypted) |plain, *enc| {
-                enc.* = plain ^ counter[@intFromPtr(enc) % 16];
-            }
-        } else {
-            return error.NoCipher;
-        }
+        var header_enc: [16]u8 = undefined;
+        self.xorKeyStream(&self.enc_cipher, &self.enc_ctr, &header_enc, &header);
 
-        // Compute header MAC
-        const header_mac = self.egress_mac.computeHeader(&header_encrypted);
+        // Compute and append header MAC
+        const header_mac = self.updateEgressMAC(&header_enc);
+        try self.write_buf.write(self.allocator, &header_enc);
+        try self.write_buf.write(self.allocator, &header_mac);
 
-        // Write header + MAC
-        try stream.writeAll(&header_encrypted);
-        try stream.writeAll(&header_mac);
-
-        // Prepare padded data
-        self.write_buf.clearRetainingCapacity();
-        try self.write_buf.appendSlice(data);
-        if (padding > 0) {
-            try self.write_buf.appendNTimes(0, padding);
-        }
-
-        // Encrypt data using AES-CTR
-        var encrypted = try self.allocator.alloc(u8, total_size);
+        // Encrypt frame data
+        const encrypted = try self.allocator.alloc(u8, padded_size);
         defer self.allocator.free(encrypted);
 
-        if (self.enc_cipher) |cipher| {
-            var i: usize = 0;
-            while (i < total_size) : (i += 16) {
-                const block_end = @min(i + 16, total_size);
-                var counter: [16]u8 = undefined;
-                @memset(&counter, 0);
-                cipher.encrypt(&counter, &counter);
+        @memcpy(encrypted[0..data.len], data);
+        if (padding > 0) {
+            @memset(encrypted[data.len..], 0);
+        }
 
-                for (self.write_buf.items[i..block_end], 0..) |plain, j| {
-                    encrypted[i + j] = plain ^ counter[j];
-                }
+        self.xorKeyStream(&self.enc_cipher, &self.enc_ctr, encrypted, encrypted);
+
+        // Compute and append frame MAC
+        const frame_mac = self.updateEgressMACFrame(encrypted);
+        try self.write_buf.write(self.allocator, encrypted);
+        try self.write_buf.write(self.allocator, &frame_mac);
+
+        // Write to stream
+        _ = try stream.write(self.write_buf.data.items);
+    }
+
+    // MAC computation following Erigon's "horrible, legacy thing"
+    fn updateEgressMAC(self: *Self, data: []const u8) [16]u8 {
+        var seed: [32]u8 = undefined;
+        self.egress_mac.final(&seed);
+        self.egress_mac = crypto.hash.sha3.Keccak256.init(.{});
+        self.egress_mac.update(&seed);
+
+        var encrypted: [16]u8 = undefined;
+        self.mac_cipher.encrypt(&encrypted, seed[0..16]);
+
+        for (&encrypted, data[0..16]) |*e, d| {
+            e.* ^= d;
+        }
+
+        self.egress_mac.update(&encrypted);
+        self.egress_mac.final(&seed);
+        self.egress_mac = crypto.hash.sha3.Keccak256.init(.{});
+        self.egress_mac.update(&seed);
+
+        return encrypted;
+    }
+
+    fn updateEgressMACFrame(self: *Self, data: []const u8) [16]u8 {
+        self.egress_mac.update(data);
+        var seed: [32]u8 = undefined;
+        self.egress_mac.final(&seed);
+        self.egress_mac = crypto.hash.sha3.Keccak256.init(.{});
+        self.egress_mac.update(&seed);
+
+        return self.updateEgressMAC(seed[0..16]);
+    }
+
+    fn updateIngressMAC(self: *Self, data: []const u8) [16]u8 {
+        var seed: [32]u8 = undefined;
+        self.ingress_mac.final(&seed);
+        self.ingress_mac = crypto.hash.sha3.Keccak256.init(.{});
+        self.ingress_mac.update(&seed);
+
+        var encrypted: [16]u8 = undefined;
+        self.mac_cipher.encrypt(&encrypted, seed[0..16]);
+
+        for (&encrypted, data[0..16]) |*e, d| {
+            e.* ^= d;
+        }
+
+        self.ingress_mac.update(&encrypted);
+        self.ingress_mac.final(&seed);
+        self.ingress_mac = crypto.hash.sha3.Keccak256.init(.{});
+        self.ingress_mac.update(&seed);
+
+        return encrypted;
+    }
+
+    fn updateIngressMACFrame(self: *Self, data: []const u8) [16]u8 {
+        self.ingress_mac.update(data);
+        var seed: [32]u8 = undefined;
+        self.ingress_mac.final(&seed);
+        self.ingress_mac = crypto.hash.sha3.Keccak256.init(.{});
+        self.ingress_mac.update(&seed);
+
+        return self.updateIngressMAC(seed[0..16]);
+    }
+
+    fn xorKeyStream(
+        self: *Self,
+        cipher: *const crypto.core.aes.Aes256,
+        ctr: *[16]u8,
+        dst: []u8,
+        src: []const u8,
+    ) void {
+        _ = self;
+        var i: usize = 0;
+        while (i < src.len) : (i += 16) {
+            var keystream: [16]u8 = undefined;
+            cipher.encrypt(&keystream, ctr);
+
+            const n = @min(16, src.len - i);
+            for (0..n) |j| {
+                dst[i + j] = src[i + j] ^ keystream[j];
+            }
+
+            // Increment counter
+            var carry: u16 = 1;
+            var k: usize = 16;
+            while (k > 0 and carry > 0) {
+                k -= 1;
+                carry += ctr[k];
+                ctr[k] = @intCast(carry & 0xFF);
+                carry >>= 8;
             }
         }
-
-        // Compute frame MAC
-        const frame_mac = self.egress_mac.computeFrame(encrypted);
-
-        // Write encrypted data + MAC
-        try stream.writeAll(encrypted);
-        try stream.writeAll(&frame_mac);
     }
 };
 
-/// RLPx message
-pub const Message = struct {
-    code: u64,
-    payload: []u8,
-};
+/// Handshake state
+const HandshakeState = struct {
+    allocator: Allocator,
+    initiator: bool,
+    remote_pubkey: [64]u8,
+    init_nonce: [32]u8,
+    resp_nonce: [32]u8,
+    ephemeral_priv: [32]u8,
+    remote_ephemeral_pub: [64]u8,
 
-/// Hash MAC state for RLPx v4 - implements the legacy MAC construction
-/// This is based on erigon/p2p/rlpx/rlpx.go hashMAC
-pub const HashMAC = struct {
-    cipher: std.crypto.core.aes.Aes128,
-    hash: std.crypto.hash.sha3.Keccak256,
-    aes_buffer: [16]u8,
-    hash_buffer: [32]u8,
-    seed_buffer: [32]u8,
-
-    pub fn init(cipher_key: []const u8, initial_hash: []const u8) HashMAC {
-        var mac = HashMAC{
-            .cipher = std.crypto.core.aes.Aes128.initEnc(cipher_key[0..16].*),
-            .hash = std.crypto.hash.sha3.Keccak256.init(.{}),
-            .aes_buffer = undefined,
-            .hash_buffer = undefined,
-            .seed_buffer = undefined,
+    fn init(allocator: Allocator) HandshakeState {
+        return .{
+            .allocator = allocator,
+            .initiator = false,
+            .remote_pubkey = undefined,
+            .init_nonce = undefined,
+            .resp_nonce = undefined,
+            .ephemeral_priv = undefined,
+            .remote_ephemeral_pub = undefined,
         };
-
-        // Initialize hash state
-        mac.hash.update(initial_hash);
-
-        return mac;
     }
 
-    /// Compute MAC for frame header
-    pub fn computeHeader(self: *HashMAC, header: []const u8) [16]u8 {
-        // Get current hash state
-        var sum1: [32]u8 = undefined;
-        var hash_copy = self.hash;
-        hash_copy.final(&sum1);
-
-        return self.compute(&sum1, header);
+    fn deinit(self: *HandshakeState) void {
+        _ = self;
+        // Sensitive data cleanup
+        // In production, securely zero out private keys
     }
 
-    /// Compute MAC for frame data
-    pub fn computeFrame(self: *HashMAC, framedata: []const u8) [16]u8 {
-        // Update hash with frame data
-        self.hash.update(framedata);
+    /// Run initiator handshake
+    fn runInitiator(
+        self: *HandshakeState,
+        stream: *net.Stream,
+        priv_key: [32]u8,
+        remote_pub: [64]u8,
+    ) !Secrets {
+        self.initiator = true;
+        self.remote_pubkey = remote_pub;
 
-        // Get hash sum as seed
-        var hash_copy = self.hash;
-        hash_copy.final(&self.seed_buffer);
+        // Generate ephemeral key and nonce
+        crypto.random.bytes(&self.ephemeral_priv);
+        crypto.random.bytes(&self.init_nonce);
 
-        return self.compute(&self.seed_buffer, self.seed_buffer[0..16]);
+        // Create and send auth message
+        const auth_msg = try self.makeAuthMsg(priv_key);
+        defer self.allocator.free(auth_msg);
+        _ = try stream.write(auth_msg);
+
+        // Receive auth-ack
+        var ack_size_buf: [2]u8 = undefined;
+        _ = try stream.read(&ack_size_buf);
+        const ack_size = std.mem.readInt(u16, &ack_size_buf, .big);
+
+        const ack_msg = try self.allocator.alloc(u8, ack_size);
+        defer self.allocator.free(ack_msg);
+        _ = try stream.read(ack_msg);
+
+        // Process auth-ack
+        try self.handleAuthResp(priv_key, ack_msg);
+
+        // Derive secrets
+        const full_ack = try self.allocator.alloc(u8, 2 + ack_size);
+        defer self.allocator.free(full_ack);
+        @memcpy(full_ack[0..2], &ack_size_buf);
+        @memcpy(full_ack[2..], ack_msg);
+
+        return try self.deriveSecrets(auth_msg, full_ack);
     }
 
-    /// Core MAC computation - the "horrible, legacy thing" from Erigon
-    /// Encrypts hash state, XORs with seed, writes back to hash, takes sum
-    fn compute(self: *HashMAC, sum1: []const u8, seed: []const u8) [16]u8 {
-        if (seed.len != 16) @panic("invalid MAC seed length");
+    /// Run recipient handshake
+    fn runRecipient(
+        self: *HandshakeState,
+        stream: *net.Stream,
+        priv_key: [32]u8,
+    ) !Secrets {
+        self.initiator = false;
 
-        // Encrypt current hash state
-        self.cipher.encrypt(&self.aes_buffer, sum1[0..16]);
+        // Generate ephemeral key and nonce
+        crypto.random.bytes(&self.ephemeral_priv);
+        crypto.random.bytes(&self.resp_nonce);
 
-        // XOR with seed
-        for (&self.aes_buffer, seed[0..16]) |*a, s| {
-            a.* ^= s;
+        // Receive auth message
+        var auth_size_buf: [2]u8 = undefined;
+        _ = try stream.read(&auth_size_buf);
+        const auth_size = std.mem.readInt(u16, &auth_size_buf, .big);
+
+        const auth_msg = try self.allocator.alloc(u8, auth_size);
+        defer self.allocator.free(auth_msg);
+        _ = try stream.read(auth_msg);
+
+        // Process auth
+        try self.handleAuthMsg(priv_key, auth_msg);
+
+        // Create and send auth-ack
+        const ack_msg = try self.makeAuthResp();
+        defer self.allocator.free(ack_msg);
+        _ = try stream.write(ack_msg);
+
+        // Derive secrets
+        const full_auth = try self.allocator.alloc(u8, 2 + auth_size);
+        defer self.allocator.free(full_auth);
+        @memcpy(full_auth[0..2], &auth_size_buf);
+        @memcpy(full_auth[2..], auth_msg);
+
+        return try self.deriveSecrets(full_auth, ack_msg);
+    }
+
+    fn makeAuthMsg(self: *HandshakeState, priv_key: [32]u8) ![]u8 {
+        // Build auth message struct (authMsgV4 from Erigon)
+        // Signature: sign(static-shared-secret ^ nonce, ephemeral-privkey)
+        // InitiatorPubkey: our static public key (64 bytes uncompressed)
+        // Nonce: random 32 bytes
+        // Version: 4 (EIP-8)
+
+        // 1. Calculate static shared secret using ECDH
+        const static_shared = try self.ecdhSharedSecret(priv_key, self.remote_pubkey);
+
+        // 2. XOR static shared secret with init nonce
+        var signed_data: [32]u8 = undefined;
+        for (static_shared, self.init_nonce, 0..) |ss, n, i| {
+            signed_data[i] = ss ^ n;
         }
 
-        // Write back to hash
-        self.hash.update(&self.aes_buffer);
+        // 3. Sign with ephemeral private key
+        const signature = try self.sign(signed_data, self.ephemeral_priv);
 
-        // Get final sum
-        var hash_copy = self.hash;
-        hash_copy.final(&self.hash_buffer);
+        // 4. Get our public key from private key
+        const our_pubkey = try self.publicKeyFromPrivate(priv_key);
 
-        // Return first 16 bytes as MAC
-        var result: [16]u8 = undefined;
-        @memcpy(&result, self.hash_buffer[0..16]);
-        return result;
+        // 5. Encode auth message as RLP: [signature, initiator-pubkey, nonce, version]
+        var msg_buf = std.ArrayList(u8).init(self.allocator);
+        defer msg_buf.deinit();
+
+        // RLP encode manually (simplified - real RLP would be more complex)
+        try msg_buf.appendSlice(&signature); // 65 bytes
+        try msg_buf.appendSlice(&our_pubkey); // 64 bytes
+        try msg_buf.appendSlice(&self.init_nonce); // 32 bytes
+        try msg_buf.append(4); // version
+
+        // 6. Add random padding (100-300 bytes) for EIP-8
+        var rng = crypto.random;
+        const padding_len = 100 + (rng.int(u8) % 200);
+        var i: usize = 0;
+        while (i < padding_len) : (i += 1) {
+            try msg_buf.append(0);
+        }
+
+        // 7. Encrypt with ECIES using remote public key
+        return try self.sealEIP8(msg_buf.items, self.remote_pubkey);
+    }
+
+    fn makeAuthResp(self: *HandshakeState) ![]u8 {
+        _ = self;
+        // TODO: Implement proper EIP-8 auth response with ECIES encryption
+        return Error.HandshakeFailed;
+    }
+
+    fn handleAuthMsg(self: *HandshakeState, priv_key: [32]u8, auth_msg: []const u8) !void {
+        _ = self;
+        _ = priv_key;
+        _ = auth_msg;
+        // TODO: Implement proper auth message decryption and validation
+        return Error.HandshakeFailed;
+    }
+
+    fn handleAuthResp(self: *HandshakeState, priv_key: [32]u8, ack_msg: []const u8) !void {
+        _ = self;
+        _ = priv_key;
+        _ = ack_msg;
+        // TODO: Implement proper auth-ack decryption and validation
+        return Error.HandshakeFailed;
+    }
+
+    fn deriveSecrets(self: *HandshakeState, auth: []const u8, authResp: []const u8) !Secrets {
+        _ = auth;
+        _ = authResp;
+
+        // TODO: Implement proper ECDH secret derivation and key derivation
+        // This should:
+        // 1. Compute ECDH shared secret from ephemeral keys
+        // 2. Derive AES and MAC keys using Keccak256
+        // 3. Initialize MAC states
+
+        var secrets: Secrets = undefined;
+        secrets.remote_pubkey = self.remote_pubkey;
+
+        // Placeholder - would be derived from ECDH
+        @memset(&secrets.aes, 0);
+        @memset(&secrets.mac, 0);
+
+        secrets.egress_mac = crypto.hash.sha3.Keccak256.init(.{});
+        secrets.ingress_mac = crypto.hash.sha3.Keccak256.init(.{});
+
+        return secrets;
     }
 };
 
-/// Initiator info extracted from auth message
-const InitiatorInfo = struct {
-    ephemeral_pub: []u8,
-    shared_secret: []const u8,
+/// Read buffer for network operations
+const ReadBuffer = struct {
+    data: std.ArrayList(u8),
+    end: usize,
+
+    fn init() ReadBuffer {
+        return .{
+            .data = std.ArrayList(u8){},
+            .end = 0,
+        };
+    }
+
+    fn deinit(self: *ReadBuffer, allocator: Allocator) void {
+        self.data.deinit(allocator);
+    }
+
+    fn reset(self: *ReadBuffer) void {
+        const unprocessed = self.end - self.data.items.len;
+        if (unprocessed > 0) {
+            std.mem.copyForwards(u8, self.data.items[0..unprocessed], self.data.items[self.data.items.len..self.end]);
+        }
+        self.end = unprocessed;
+        self.data.clearRetainingCapacity();
+    }
+
+    fn read(self: *ReadBuffer, allocator: Allocator, stream: *net.Stream, n: usize) ![]u8 {
+        if (self.data.items.ptr == null) {
+            self.data = std.ArrayList(u8).init(allocator);
+        }
+
+        const offset = self.data.items.len;
+        const have = self.end - self.data.items.len;
+
+        if (have >= n) {
+            try self.data.resize(allocator, offset + n);
+            return self.data.items[offset .. offset + n];
+        }
+
+        const need = n - have;
+        try self.data.resize(allocator, self.end + need);
+
+        const bytes_read = try stream.read(self.data.items[self.end..]);
+        if (bytes_read < need) return Error.ConnectionClosed;
+
+        self.end += bytes_read;
+        try self.data.resize(allocator, offset + n);
+
+        return self.data.items[offset .. offset + n];
+    }
 };
 
-/// ECDH shared secret derivation
-fn ecdhSharedSecret(priv_key: []const u8, pub_key: []const u8) ![32]u8 {
-    var priv_fixed: [32]u8 = undefined;
-    var pub_fixed: [64]u8 = undefined;
-    @memcpy(&priv_fixed, priv_key[0..32]);
-    @memcpy(&pub_fixed, pub_key[0..64]);
+/// Write buffer for network operations
+const WriteBuffer = struct {
+    data: std.ArrayList(u8),
 
-    return try crypto.ECIES.generateShared(priv_fixed, pub_fixed);
-}
+    fn init() WriteBuffer {
+        return .{ .data = std.ArrayList(u8){} };
+    }
 
-test "RLPx connection creation" {
+    fn deinit(self: *WriteBuffer, allocator: Allocator) void {
+        self.data.deinit(allocator);
+    }
+
+    fn reset(self: *WriteBuffer) void {
+        self.data.clearRetainingCapacity();
+    }
+
+    fn write(self: *WriteBuffer, allocator: Allocator, bytes: []const u8) !void {
+        if (self.data.items.ptr == null) {
+            self.data = std.ArrayList(u8).init(allocator);
+        }
+        try self.data.appendSlice(allocator, bytes);
+    }
+};
+
+test "RLPx buffer operations" {
     const allocator = std.testing.allocator;
 
-    // Create mock stream (for testing, would need actual network connection)
-    // This test validates the structure compiles
-    _ = allocator;
+    // Test WriteBuffer
+    var wb = WriteBuffer.init();
+    defer wb.deinit(allocator);
+
+    try wb.write(allocator, &[_]u8{ 1, 2, 3 });
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3 }, wb.data.items);
+
+    wb.reset();
+    try std.testing.expectEqual(@as(usize, 0), wb.data.items.len);
 }

@@ -194,25 +194,79 @@ pub const StatusMessage = struct {
     };
 
     pub fn encode(self: *const StatusMessage, allocator: std.mem.Allocator) ![]u8 {
-        _ = self;
-        _ = allocator;
-        // In production: RLP encode
-        return &[_]u8{};
+        const rlp = @import("primitives").rlp;
+        var encoder = rlp.Encoder.init(allocator);
+        defer encoder.deinit();
+
+        // Status message structure: [protocol_version, network_id, total_difficulty, best_hash, genesis_hash, fork_id]
+        try encoder.startList();
+        try encoder.writeInt(self.protocol_version);
+        try encoder.writeInt(self.network_id);
+        try encoder.writeBytes(&self.total_difficulty);
+        try encoder.writeBytes(&self.best_hash);
+        try encoder.writeBytes(&self.genesis_hash);
+
+        // ForkId is a list: [hash, next]
+        try encoder.startList();
+        try encoder.writeBytes(&self.fork_id.hash);
+        try encoder.writeInt(self.fork_id.next);
+        try encoder.endList();
+
+        try encoder.endList();
+
+        return encoder.toOwnedSlice();
     }
 
     pub fn decode(data: []const u8, allocator: std.mem.Allocator) !StatusMessage {
-        _ = data;
-        _ = allocator;
-        // In production: RLP decode
+        const rlp = @import("primitives").rlp;
+        var decoder = rlp.Decoder.init(data);
+        var list = try decoder.enterList();
+
+        const protocol_version: u8 = @intCast(try list.decodeInt());
+        const network_id = try list.decodeInt();
+
+        // Total difficulty (32 bytes)
+        const td_bytes = try list.decodeBytesView();
+        var total_difficulty: [32]u8 = [_]u8{0} ** 32;
+        if (td_bytes.len <= 32) {
+            // Right-align the bytes (big-endian)
+            const offset = 32 - td_bytes.len;
+            @memcpy(total_difficulty[offset..], td_bytes);
+        } else {
+            return error.InvalidTotalDifficulty;
+        }
+
+        // Best hash (32 bytes)
+        const best_hash_bytes = try list.decodeBytesView();
+        if (best_hash_bytes.len != 32) return error.InvalidBestHash;
+        var best_hash: [32]u8 = undefined;
+        @memcpy(&best_hash, best_hash_bytes);
+
+        // Genesis hash (32 bytes)
+        const genesis_hash_bytes = try list.decodeBytesView();
+        if (genesis_hash_bytes.len != 32) return error.InvalidGenesisHash;
+        var genesis_hash: [32]u8 = undefined;
+        @memcpy(&genesis_hash, genesis_hash_bytes);
+
+        // ForkId: [hash, next]
+        var fork_list = try list.enterList();
+        const fork_hash_bytes = try fork_list.decodeBytesView();
+        if (fork_hash_bytes.len != 4) return error.InvalidForkIdHash;
+        var fork_hash: [4]u8 = undefined;
+        @memcpy(&fork_hash, fork_hash_bytes);
+        const fork_next = try fork_list.decodeInt();
+
+        _ = allocator; // For future use if needed
+
         return StatusMessage{
-            .protocol_version = 68,
-            .network_id = 1,
-            .total_difficulty = [_]u8{0} ** 32,
-            .best_hash = [_]u8{0} ** 32,
-            .genesis_hash = [_]u8{0} ** 32,
+            .protocol_version = protocol_version,
+            .network_id = network_id,
+            .total_difficulty = total_difficulty,
+            .best_hash = best_hash,
+            .genesis_hash = genesis_hash,
             .fork_id = .{
-                .hash = [_]u8{0} ** 4,
-                .next = 0,
+                .hash = fork_hash,
+                .next = fork_next,
             },
         };
     }
@@ -301,12 +355,33 @@ pub const Peer = struct {
     pub fn sendMessage(self: *Peer, msg_type: MessageType, data: []const u8) !void {
         if (!self.connected) return error.PeerDisconnected;
 
-        std.log.debug("Sending {} to peer ({}  bytes)", .{
+        std.log.debug("Sending {} to peer ({} bytes)", .{
             msg_type.toString(),
             data.len,
         });
 
-        // In production: Encode message with RLPx framing
+        // RLPx message framing:
+        // 1. Message code is the first byte (msg_type as u8)
+        // 2. Message payload follows
+        // 3. The RLPx layer (via rlpx.zig) handles encryption, MAC, and framing
+        //
+        // For production:
+        // - Create RLPx connection (from rlpx.zig)
+        // - Call conn.writeMsg(@intFromEnum(msg_type), data)
+        // - RLPx handles: RLP encoding, snappy compression (if enabled), encryption, MAC
+        //
+        // Message format after RLPx processing:
+        // [frame-header(32)][frame-data(encrypted)][frame-mac(16)]
+        // where frame-header = [frame-size(3)][protocol-header(13)]
+        //
+        // Note: In the current stub, we would need to:
+        // 1. Store an RLPx connection in Peer
+        // 2. Call rlpx_conn.writeMsg() here
+        // 3. Handle network I/O errors appropriately
+
+        // TODO: Implement actual RLPx connection and message sending
+        // For now, this is a stub that will be implemented when we integrate
+        // the full P2P networking stack with TCP connections
     }
 
     pub fn disconnect(self: *Peer, reason: []const u8) void {
@@ -351,11 +426,57 @@ pub const NetworkManager = struct {
     }
 
     /// Start listening for connections
-    pub fn start(self: *NetworkManager, port: u16) !void {
+    pub fn start(_: *NetworkManager, port: u16) !void {
         std.log.info("Starting P2P network on port {}", .{port});
 
-        // In production: Start TCP server, discovery protocol, etc.
-        _ = self;
+        // P2P Network Startup Process (based on erigon/p2p/server.go):
+        //
+        // 1. TCP Server Setup:
+        //    - Bind to 0.0.0.0:port (IPv4) or [::]:port (IPv6)
+        //    - Start accept loop in separate thread
+        //    - Each accepted connection goes through:
+        //      a. RLPx handshake (encryption setup)
+        //      b. devp2p Hello message exchange
+        //      c. Protocol capability negotiation
+        //      d. Add to peers list
+        //
+        // 2. Discovery Protocol (UDP):
+        //    - Bind to same port for discovery
+        //    - Start discv4 or discv5 protocol
+        //    - Send/receive Ping, Pong, FindNode, Neighbors messages
+        //    - Maintain Kademlia routing table
+        //    - Bootstrap from known nodes
+        //
+        // 3. Dial Scheduler:
+        //    - Maintain static and dynamic peer lists
+        //    - Continuously attempt outbound connections
+        //    - Respect max peer limits
+        //    - Implement exponential backoff for failed dials
+        //
+        // 4. Peer Management:
+        //    - Track peer states (connecting, handshaking, connected)
+        //    - Monitor peer health (timeouts, errors)
+        //    - Enforce protocol rules
+        //    - Handle peer disconnections gracefully
+        //
+        // Implementation approach:
+        // - Use std.net.StreamServer for TCP
+        // - Implement discovery protocol separately
+        // - Use thread pool for concurrent connection handling
+        // - Implement event loop for peer management
+        //
+        // Key components needed:
+        // - Server struct with StreamServer
+        // - Discovery struct (discv4/discv5)
+        // - DialScheduler for outbound connections
+        // - Peer pool with connection lifecycle management
+
+        // TODO: Full TCP server and discovery implementation
+        // This requires significant networking infrastructure including:
+        // - Thread-safe peer management
+        // - Connection pooling
+        // - Discovery protocol state machine
+        // - Event loop for message routing
     }
 
     /// Connect to a peer
@@ -391,9 +512,36 @@ pub const NetworkManager = struct {
             },
         };
 
-        // In production: Actually send over network
+        // Network message sending for Status exchange:
+        //
+        // 1. Encode Status message to RLP
         const status_data = try status.encode(self.allocator);
         defer self.allocator.free(status_data);
+
+        // 2. Send via RLPx connection (production implementation):
+        //    - peer.rlpx_conn.writeMsg(@intFromEnum(MessageType.Status), status_data)
+        //    - RLPx layer handles:
+        //      a. RLP encoding of [code, payload]
+        //      b. Snappy compression (if negotiated)
+        //      c. AES-CTR encryption
+        //      d. MAC computation (egress MAC)
+        //      e. Frame construction: [header(32)][data(encrypted)][mac(16)]
+        //
+        // 3. Wait for Status response:
+        //    - peer.rlpx_conn.readMsg()
+        //    - Verify message code is Status (0x00)
+        //    - Decode Status message
+        //    - Validate compatibility (network_id, genesis_hash, fork_id)
+        //    - Call peer.handshake(status_response)
+        //
+        // 4. Error handling:
+        //    - Network errors: disconnect peer
+        //    - Protocol errors: send Disconnect message with reason
+        //    - Timeout: configurable (usually 5-10 seconds)
+        //
+        // Note: The actual sending happens through the RLPx connection
+        // which is stored in the Peer struct. This stub shows the flow
+        // but doesn't implement the full networking stack.
 
         try self.peers.append(self.allocator, peer);
         std.log.info("Connected to peer at {}", .{address});
@@ -428,9 +576,40 @@ pub const NetworkManager = struct {
             from_block,
         });
 
-        // In production: Encode and send
-        _ = request;
-        try peer.sendMessage(.GetBlockHeaders, &[_]u8{});
+        // Encode GetBlockHeaders request (eth/66+ format):
+        //
+        // Message structure: [request_id, [origin, amount, skip, reverse]]
+        // where origin is either block_number (uint64) or block_hash ([32]u8)
+        //
+        // Implementation:
+        const rlp = @import("primitives").rlp;
+        var encoder = rlp.Encoder.init(self.allocator);
+        defer encoder.deinit();
+
+        // Outer list: [request_id, request_data]
+        try encoder.startList();
+        try encoder.writeInt(request.request_id);
+
+        // Inner list: [origin, amount, skip, reverse]
+        try encoder.startList();
+
+        // Origin: block number or hash
+        switch (request.origin) {
+            .number => |num| try encoder.writeInt(num),
+            .hash => |hash| try encoder.writeBytes(&hash),
+        }
+
+        try encoder.writeInt(request.amount);
+        try encoder.writeInt(request.skip);
+        try encoder.writeInt(if (request.reverse) @as(u8, 1) else @as(u8, 0));
+        try encoder.endList();
+
+        try encoder.endList();
+
+        const encoded = try encoder.toOwnedSlice();
+        defer self.allocator.free(encoded);
+
+        try peer.sendMessage(.GetBlockHeaders, encoded);
     }
 
     /// Broadcast new block to peers
@@ -443,9 +622,34 @@ pub const NetworkManager = struct {
         for (self.peers.items) |peer| {
             if (!peer.connected) continue;
 
-            // Send NewBlockHashes for announcement
-            // In production: RLP encode
-            try peer.sendMessage(.NewBlockHashes, &[_]u8{});
+            // Encode NewBlockHashes announcement:
+            //
+            // Message structure: [[hash, number], [hash, number], ...]
+            // Each block announcement contains:
+            // - hash: 32-byte block hash
+            // - number: block number
+            //
+            // For a single block announcement:
+            const rlp = @import("primitives").rlp;
+            var encoder = rlp.Encoder.init(self.allocator);
+            defer encoder.deinit();
+
+            // Outer list containing block announcements
+            try encoder.startList();
+
+            // Single block announcement: [hash, number]
+            try encoder.startList();
+            const block_hash = block.hash();
+            try encoder.writeBytes(&block_hash);
+            try encoder.writeInt(block.number());
+            try encoder.endList();
+
+            try encoder.endList();
+
+            const encoded = try encoder.toOwnedSlice();
+            defer self.allocator.free(encoded);
+
+            try peer.sendMessage(.NewBlockHashes, encoded);
         }
     }
 

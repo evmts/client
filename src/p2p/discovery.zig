@@ -5,8 +5,12 @@
 //! Spec: https://github.com/ethereum/devp2p/blob/master/discv4.md
 
 const std = @import("std");
-const crypto = @import("crypto");
-const rlp = @import("primitives").rlp;
+const crypto_root = @import("guillotine_primitives").crypto;
+const rlp = @import("guillotine_primitives").Rlp;
+
+// Use crypto functions from crypto module
+const keccak256 = crypto_root.Hash.keccak256;
+const Crypto = crypto_root.Crypto;
 
 const PROTOCOL_VERSION: u8 = 4;
 const MAX_PACKET_SIZE: usize = 1280;
@@ -211,11 +215,65 @@ pub const BootstrapState = enum {
     completed,
 };
 
+/// Discovery metrics for monitoring
+pub const DiscoveryMetrics = struct {
+    pings_sent: u64,
+    pongs_received: u64,
+    findnode_sent: u64,
+    neighbors_received: u64,
+    enr_requests_sent: u64,
+    enr_responses_received: u64,
+    bonds_established: u64,
+    nodes_added: u64,
+    nodes_replaced: u64,
+    revalidations: u64,
+    expired_packets: u64,
+    invalid_packets: u64,
+
+    pub fn init() DiscoveryMetrics {
+        return .{
+            .pings_sent = 0,
+            .pongs_received = 0,
+            .findnode_sent = 0,
+            .neighbors_received = 0,
+            .enr_requests_sent = 0,
+            .enr_responses_received = 0,
+            .bonds_established = 0,
+            .nodes_added = 0,
+            .nodes_replaced = 0,
+            .revalidations = 0,
+            .expired_packets = 0,
+            .invalid_packets = 0,
+        };
+    }
+
+    pub fn log(self: *const DiscoveryMetrics) void {
+        std.log.info("Discovery metrics: pings={d} pongs={d} findnode={d} neighbors={d} bonds={d} nodes={d} revalidations={d}", .{
+            self.pings_sent,
+            self.pongs_received,
+            self.findnode_sent,
+            self.neighbors_received,
+            self.bonds_established,
+            self.nodes_added,
+            self.revalidations,
+        });
+    }
+};
+
 /// Pending ping tracker for bond verification
 pub const PendingPing = struct {
     node_id: [32]u8,
     sent_at: i64,
     ping_hash: [32]u8,
+    deadline: i64,
+};
+
+/// Bond state for tracking ping-pong exchanges
+pub const BondState = struct {
+    node_id: [32]u8,
+    last_ping_sent: i64,
+    last_pong_received: i64,
+    bonded: bool,
 };
 
 /// Discovery v4 protocol handler
@@ -228,12 +286,22 @@ pub const UDPv4 = struct {
     running: bool,
     bootstrap_state: BootstrapState,
     pending_pings: std.AutoHashMap([32]u8, PendingPing),
+    bond_states: std.AutoHashMap([32]u8, BondState),
     bootnodes: []Node,
     last_lookup: i64,
+    last_revalidate: i64,
+    last_metrics_log: i64,
+    mutex: std.Thread.Mutex,
+    metrics: DiscoveryMetrics,
 
     const Self = @This();
     const BOND_TIMEOUT = 10; // 10 seconds
+    const BOND_EXPIRATION = 24 * 3600; // 24 hours
     const LOOKUP_INTERVAL = 60; // 60 seconds
+    const REVALIDATE_INTERVAL = 5; // 5 seconds
+    const RESP_TIMEOUT = 750; // 750ms response timeout
+    const METRICS_LOG_INTERVAL = 60; // Log metrics every 60 seconds
+    const MAX_FINDNODE_FAILURES = 5;
 
     pub fn init(allocator: std.mem.Allocator, bind_addr: std.net.Address, priv_key: [32]u8) !*Self {
         const self = try allocator.create(Self);
@@ -250,7 +318,7 @@ pub const UDPv4 = struct {
         try std.posix.bind(socket, &bind_addr.any, bind_addr.getOsSockLen());
 
         // Initialize local node
-        const node_id = crypto.keccak256(&priv_key); // Public key hash
+        const node_id = keccak256(&priv_key); // Public key hash
         const local_node = Node{
             .id = node_id,
             .ip = bind_addr,
@@ -267,11 +335,33 @@ pub const UDPv4 = struct {
             .running = false,
             .bootstrap_state = .idle,
             .pending_pings = std.AutoHashMap([32]u8, PendingPing).init(allocator),
+            .bond_states = std.AutoHashMap([32]u8, BondState).init(allocator),
             .bootnodes = &[_]Node{},
             .last_lookup = 0,
+            .last_revalidate = 0,
+            .last_metrics_log = 0,
+            .mutex = std.Thread.Mutex{},
+            .metrics = DiscoveryMetrics.init(),
         };
 
         return self;
+    }
+
+    /// Log metrics periodically
+    pub fn logMetrics(self: *Self) void {
+        const now = std.time.timestamp();
+        if (now - self.last_metrics_log < METRICS_LOG_INTERVAL) {
+            return;
+        }
+
+        self.last_metrics_log = now;
+        self.metrics.log();
+
+        std.log.info("Discovery table stats: total={d} live={d} buckets_needing_refresh={d}", .{
+            self.routing_table.len(),
+            self.routing_table.liveCount(),
+            0, // TODO: get stale bucket count
+        });
     }
 
     pub fn deinit(self: *Self) void {
@@ -279,7 +369,42 @@ pub const UDPv4 = struct {
         std.posix.close(self.socket);
         self.routing_table.deinit();
         self.pending_pings.deinit();
+        self.bond_states.deinit();
         self.allocator.destroy(self);
+    }
+
+    /// Check if node has a valid bond
+    fn checkBond(self: *Self, node_id: [32]u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.bond_states.get(node_id)) |state| {
+            const now = std.time.timestamp();
+            const age = now - state.last_pong_received;
+            return state.bonded and age < BOND_EXPIRATION;
+        }
+        return false;
+    }
+
+    /// Ensure bond with node before sending findnode
+    fn ensureBond(self: *Self, node: *const Node) !void {
+        if (self.checkBond(node.id)) {
+            return; // Already bonded
+        }
+
+        // Send ping to establish bond
+        try self.bond(node);
+
+        // Wait for pong response (simplified - should use async)
+        var retries: usize = 0;
+        while (retries < 10) : (retries += 1) {
+            std.time.sleep(100 * std.time.ns_per_ms);
+            if (self.checkBond(node.id)) {
+                return;
+            }
+        }
+
+        return error.BondTimeout;
     }
 
     /// Bootstrap discovery with provided bootnodes
@@ -329,16 +454,28 @@ pub const UDPv4 = struct {
         const payload = try ping_packet.encode(self.allocator);
         defer self.allocator.free(payload);
 
-        const ping_hash = crypto.keccak256(payload);
+        const ping_hash = keccak256(payload);
 
-        // Track pending ping
+        // Track pending ping with deadline
+        self.mutex.lock();
         try self.pending_pings.put(node.id, .{
             .node_id = node.id,
             .sent_at = now,
             .ping_hash = ping_hash,
+            .deadline = now + BOND_TIMEOUT,
         });
 
+        // Update bond state
+        try self.bond_states.put(node.id, .{
+            .node_id = node.id,
+            .last_ping_sent = now,
+            .last_pong_received = 0,
+            .bonded = false,
+        });
+        self.mutex.unlock();
+
         try self.sendPacket(.ping, payload, node.ip);
+        self.metrics.pings_sent += 1;
         std.log.debug("Sent bond ping to node", .{});
     }
 
@@ -457,6 +594,9 @@ pub const UDPv4 = struct {
 
     /// Send find_node request
     pub fn findNode(self: *Self, node: *const Node, target: [32]u8) !void {
+        // Ensure we have bond before sending findnode
+        try self.ensureBond(node);
+
         const now = std.time.timestamp();
         const find_packet = FindNode{
             .target = target,
@@ -467,6 +607,29 @@ pub const UDPv4 = struct {
         defer self.allocator.free(payload);
 
         try self.sendPacket(.find_node, payload, node.ip);
+        self.metrics.findnode_sent += 1;
+        std.log.debug("Sent findnode request", .{});
+    }
+
+    /// Request ENR from node
+    pub fn requestENR(self: *Self, node: *const Node) !void {
+        // Ensure bond before requesting ENR
+        try self.ensureBond(node);
+
+        const now = std.time.timestamp();
+        var encoder = rlp.Encoder.init(self.allocator);
+        defer encoder.deinit();
+
+        try encoder.startList();
+        try encoder.writeInt(@as(u64, @intCast(now + 60))); // expiration
+        try encoder.endList();
+
+        const payload = try encoder.toOwnedSlice();
+        defer self.allocator.free(payload);
+
+        try self.sendPacket(.enr_request, payload, node.ip);
+        self.metrics.enr_requests_sent += 1;
+        std.log.debug("Sent ENR request", .{});
     }
 
     /// Send a packet
@@ -480,8 +643,8 @@ pub const UDPv4 = struct {
         try packet.appendSlice(payload);
 
         // Sign packet
-        const hash = crypto.keccak256(packet.items);
-        const signature = try crypto.signHash(&self.priv_key, &hash);
+        const hash = keccak256(packet.items);
+        const signature = try Crypto.unaudited_signHash(&self.priv_key, &hash);
 
         // Build final packet
         var final_packet = std.ArrayList(u8).init(self.allocator);
@@ -503,7 +666,10 @@ pub const UDPv4 = struct {
 
     /// Handle received packet
     fn handlePacket(self: *Self, data: []const u8, src: std.net.Address) !void {
-        if (data.len < 98) return error.PacketTooSmall; // hash(32) + sig(65) + type(1)
+        if (data.len < 98) {
+            self.metrics.invalid_packets += 1;
+            return error.PacketTooSmall; // hash(32) + sig(65) + type(1)
+        }
 
         // Extract components
         const hash = data[0..32];
@@ -512,23 +678,102 @@ pub const UDPv4 = struct {
         const payload = data[98..];
 
         // Verify hash
-        const computed_hash = crypto.keccak256(data[97..]);
+        const computed_hash = keccak256(data[97..]);
         if (!std.mem.eql(u8, hash, &computed_hash)) {
+            self.metrics.invalid_packets += 1;
             return error.InvalidHash;
         }
 
-        // Verify signature and recover sender ID
-        const sender_id = try crypto.recoverPublicKey(&computed_hash, signature);
-        _ = sender_id; // TODO: Use for authentication
+        // Verify signature and recover sender ID (public key hash)
+        const sender_pubkey = try Crypto.unaudited_recoverAddress(&computed_hash, signature);
+        var sender_id: [32]u8 = undefined;
+        @memcpy(&sender_id, &sender_pubkey[0..32]);
 
         // Dispatch based on packet type
         switch (packet_type) {
             .ping => try self.handlePing(payload, src),
             .pong => try self.handlePong(payload, src),
-            .find_node => try self.handleFindNode(payload, src),
+            .find_node => try self.handleFindNode(payload, src, sender_id),
             .neighbors => try self.handleNeighbors(payload, src),
-            .enr_request => {}, // TODO
-            .enr_response => {}, // TODO
+            .enr_request => try self.handleENRRequest(payload, src, hash),
+            .enr_response => try self.handleENRResponse(payload, src),
+        }
+    }
+
+    /// Handle ENR request packet
+    fn handleENRRequest(self: *Self, payload: []const u8, src: std.net.Address, request_hash: []const u8) !void {
+        var decoder = rlp.Decoder.init(payload);
+        var list_decoder = try decoder.enterList();
+
+        const expiration = try list_decoder.decodeInt();
+        const now: u64 = @intCast(std.time.timestamp());
+        if (expiration < now) {
+            self.metrics.expired_packets += 1;
+            return error.ExpiredPacket;
+        }
+
+        // Create ENR response (simplified - would include actual ENR record)
+        var response = std.ArrayList(u8).init(self.allocator);
+        defer response.deinit();
+
+        var encoder = rlp.Encoder.init(self.allocator);
+        defer encoder.deinit();
+
+        try encoder.startList();
+        try encoder.writeBytes(request_hash); // Reply token
+        // TODO: Add actual ENR record here
+        try encoder.writeInt(@as(u64, 0)); // Placeholder ENR seq
+        try encoder.endList();
+
+        const enr_payload = try encoder.toOwnedSlice();
+        defer self.allocator.free(enr_payload);
+
+        try self.sendPacket(.enr_response, enr_payload, src);
+        std.log.debug("Sent ENR response", .{});
+    }
+
+    /// Handle ENR response packet
+    fn handleENRResponse(self: *Self, payload: []const u8, src: std.net.Address) !void {
+        _ = src;
+        var decoder = rlp.Decoder.init(payload);
+        var list_decoder = try decoder.enterList();
+
+        const reply_token = try list_decoder.decodeBytesView();
+        _ = reply_token; // TODO: Match with pending request
+
+        self.metrics.enr_responses_received += 1;
+        std.log.debug("Received ENR response", .{});
+    }
+
+    /// Revalidation loop - periodically check node liveness
+    pub fn revalidate(self: *Self) !void {
+        const now = std.time.timestamp();
+
+        if (now - self.last_revalidate < REVALIDATE_INTERVAL) {
+            return; // Too soon
+        }
+
+        self.last_revalidate = now;
+
+        // Get a random node to revalidate
+        const node_opt = self.routing_table.nodeToRevalidate();
+        if (node_opt) |node| {
+            // Send ping to check liveness
+            try self.ping(&node);
+
+            // Wait for response (simplified)
+            std.time.sleep(RESP_TIMEOUT * std.time.ns_per_ms);
+
+            // Check if we got pong
+            if (!self.checkBond(node.id)) {
+                // Node didn't respond, replace it
+                try self.routing_table.replaceDead(node);
+                self.metrics.nodes_replaced += 1;
+                std.log.info("Removed dead node during revalidation", .{});
+            } else {
+                self.metrics.revalidations += 1;
+                std.log.debug("Node revalidated successfully", .{});
+            }
         }
     }
 
@@ -546,7 +791,10 @@ pub const UDPv4 = struct {
 
         // Check expiration
         const now: u64 = @intCast(std.time.timestamp());
-        if (expiration < now) return error.ExpiredPacket;
+        if (expiration < now) {
+            self.metrics.expired_packets += 1;
+            return error.ExpiredPacket;
+        }
 
         // Send pong response
         const pong_packet = Pong{
@@ -555,7 +803,7 @@ pub const UDPv4 = struct {
                 .udp_port = src.getPort(),
                 .tcp_port = src.getPort(),
             },
-            .ping_hash = crypto.keccak256(payload),
+            .ping_hash = keccak256(payload),
             .expiration = @intCast(now + 60),
             .enr_seq = null,
         };
@@ -578,12 +826,25 @@ pub const UDPv4 = struct {
         var ping_hash: [32]u8 = undefined;
         @memcpy(&ping_hash, ping_hash_bytes[0..32]);
 
+        const now = std.time.timestamp();
+
         // Verify this matches a pending ping
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         var iter = self.pending_pings.iterator();
         while (iter.next()) |entry| {
             const pending = entry.value_ptr.*;
             if (std.mem.eql(u8, &pending.ping_hash, &ping_hash)) {
-                // Bond verified - add node to routing table
+                // Bond verified - update bond state
+                try self.bond_states.put(pending.node_id, .{
+                    .node_id = pending.node_id,
+                    .last_ping_sent = pending.sent_at,
+                    .last_pong_received = now,
+                    .bonded = true,
+                });
+
+                // Add verified node to routing table
                 const node = Node{
                     .id = pending.node_id,
                     .ip = src,
@@ -591,10 +852,14 @@ pub const UDPv4 = struct {
                     .tcp_port = src.getPort(),
                 };
 
-                try self.routing_table.addNode(node);
+                try self.routing_table.addVerifiedNode(node);
                 _ = self.pending_pings.remove(pending.node_id);
 
-                std.log.debug("Bond verified, node added to routing table", .{});
+                self.metrics.pongs_received += 1;
+                self.metrics.bonds_established += 1;
+                self.metrics.nodes_added += 1;
+
+                std.log.info("Bond verified, node added to routing table", .{});
                 return;
             }
         }
@@ -602,7 +867,7 @@ pub const UDPv4 = struct {
         std.log.warn("Received pong with unknown ping hash", .{});
     }
 
-    fn handleFindNode(self: *Self, payload: []const u8, src: std.net.Address) !void {
+    fn handleFindNode(self: *Self, payload: []const u8, src: std.net.Address, sender_id: [32]u8) !void {
         var decoder = rlp.Decoder.init(payload);
         var list_decoder = try decoder.enterList();
 
@@ -612,7 +877,16 @@ pub const UDPv4 = struct {
 
         const expiration = try list_decoder.decodeInt();
         const now: u64 = @intCast(std.time.timestamp());
-        if (expiration < now) return error.ExpiredPacket;
+        if (expiration < now) {
+            self.metrics.expired_packets += 1;
+            return error.ExpiredPacket;
+        }
+
+        // Verify bond before responding (prevents amplification attacks)
+        if (!self.checkBond(sender_id)) {
+            std.log.warn("Rejecting findnode from unbonded node", .{});
+            return error.UnbondedNode;
+        }
 
         // Find closest nodes
         const closest = try self.routing_table.findClosest(target, 16);
@@ -628,6 +902,7 @@ pub const UDPv4 = struct {
         defer self.allocator.free(neighbors_payload);
 
         try self.sendPacket(.neighbors, neighbors_payload, src);
+        std.log.debug("Sent {} neighbors in response to findnode", .{closest.len});
     }
 
     fn handleNeighbors(self: *Self, payload: []const u8, src: std.net.Address) !void {
@@ -638,6 +913,7 @@ pub const UDPv4 = struct {
 
         // Decode nodes list
         var nodes_list = try list_decoder.enterList();
+        var count: usize = 0;
 
         while (!nodes_list.isEmpty()) {
             var node_list = try nodes_list.enterList();
@@ -661,7 +937,7 @@ pub const UDPv4 = struct {
             var node_id: [32]u8 = undefined;
             @memcpy(&node_id, node_id_bytes[0..32]);
 
-            // Create and add node
+            // Create and add node as seen (not verified yet)
             var node_addr = ip_addr;
             node_addr.setPort(udp_port);
 
@@ -672,9 +948,13 @@ pub const UDPv4 = struct {
                 .tcp_port = tcp_port,
             };
 
-            try self.routing_table.addNode(node);
-            std.log.debug("Added neighbor node to routing table", .{});
+            // Add as seen node (will be verified through bond process)
+            try self.routing_table.addSeenNode(node);
+            count += 1;
         }
+
+        self.metrics.neighbors_received += 1;
+        std.log.debug("Received {} neighbor nodes", .{count});
     }
 };
 
@@ -683,22 +963,51 @@ pub const KademliaTable = struct {
     allocator: std.mem.Allocator,
     local_id: [32]u8,
     buckets: [256]Bucket, // 256 buckets for 256-bit node IDs
+    mutex: std.Thread.Mutex,
+    rand: std.Random.DefaultPrng,
 
     const BUCKET_SIZE = 16;
+    const MAX_REPLACEMENTS = 10;
+    const BUCKET_REFRESH_INTERVAL = 3600; // 1 hour in seconds
+
+    pub const BucketEntry = struct {
+        node: Node,
+        added_at: i64,
+        liveness_checks: u32,
+        last_seen: i64,
+    };
 
     pub const Bucket = struct {
-        nodes: std.ArrayList(Node),
+        entries: std.ArrayList(BucketEntry),
+        replacements: std.ArrayList(BucketEntry),
+        last_refresh: i64,
+
+        pub fn init(allocator: std.mem.Allocator) Bucket {
+            return .{
+                .entries = std.ArrayList(BucketEntry).init(allocator),
+                .replacements = std.ArrayList(BucketEntry).init(allocator),
+                .last_refresh = 0,
+            };
+        }
+
+        pub fn deinit(self: *Bucket) void {
+            self.entries.deinit();
+            self.replacements.deinit();
+        }
     };
 
     pub fn init(allocator: std.mem.Allocator, local_id: [32]u8) !*KademliaTable {
         const self = try allocator.create(KademliaTable);
         self.allocator = allocator;
         self.local_id = local_id;
+        self.mutex = std.Thread.Mutex{};
+
+        // Initialize PRNG with current timestamp
+        const seed = @as(u64, @intCast(std.time.timestamp()));
+        self.rand = std.Random.DefaultPrng.init(seed);
 
         for (&self.buckets) |*bucket| {
-            bucket.* = Bucket{
-                .nodes = std.ArrayList(Node).init(allocator),
-            };
+            bucket.* = Bucket.init(allocator);
         }
 
         return self;
@@ -706,38 +1015,230 @@ pub const KademliaTable = struct {
 
     pub fn deinit(self: *KademliaTable) void {
         for (&self.buckets) |*bucket| {
-            bucket.nodes.deinit();
+            bucket.deinit();
         }
         self.allocator.destroy(self);
     }
 
-    /// Add node to routing table
-    pub fn addNode(self: *KademliaTable, node: Node) !void {
+    /// Add verified node to routing table (bonded nodes only)
+    /// Implements table.go's addVerifiedNode with proper bucket management
+    pub fn addVerifiedNode(self: *KademliaTable, node: Node) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (std.mem.eql(u8, &node.id, &self.local_id)) {
+            return; // Don't add ourselves
+        }
+
         const bucket_idx = self.bucketIndex(&node.id);
         const bucket = &self.buckets[bucket_idx];
+        const now = std.time.timestamp();
 
-        // Check if node already exists
-        for (bucket.nodes.items) |existing| {
-            if (std.mem.eql(u8, &existing.id, &node.id)) {
-                return; // Already have this node
+        // Check if node already exists and move to front (most recently seen)
+        for (bucket.entries.items, 0..) |*entry, i| {
+            if (std.mem.eql(u8, &entry.node.id, &node.id)) {
+                entry.last_seen = now;
+                entry.liveness_checks += 1;
+
+                // Move to front (LRU)
+                if (i > 0) {
+                    const moved_entry = entry.*;
+                    var j = i;
+                    while (j > 0) : (j -= 1) {
+                        bucket.entries.items[j] = bucket.entries.items[j - 1];
+                    }
+                    bucket.entries.items[0] = moved_entry;
+                }
+                return;
             }
         }
 
-        // Add if bucket not full
-        if (bucket.nodes.items.len < BUCKET_SIZE) {
-            try bucket.nodes.append(node);
+        // Node not in bucket, try to add it
+        if (bucket.entries.items.len < BUCKET_SIZE) {
+            // Bucket has space, add to front
+            try bucket.entries.insert(0, .{
+                .node = node,
+                .added_at = now,
+                .liveness_checks = 0,
+                .last_seen = now,
+            });
+            std.log.debug("Added verified node to bucket {d}", .{bucket_idx});
+        } else {
+            // Bucket full, add to replacements
+            try self.addReplacement(bucket, node, now);
         }
-        // TODO: Implement bucket eviction policy
+    }
+
+    /// Add node to routing table (seen but not yet verified)
+    pub fn addSeenNode(self: *KademliaTable, node: Node) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (std.mem.eql(u8, &node.id, &self.local_id)) {
+            return;
+        }
+
+        const bucket_idx = self.bucketIndex(&node.id);
+        const bucket = &self.buckets[bucket_idx];
+        const now = std.time.timestamp();
+
+        // Check if already exists
+        for (bucket.entries.items) |entry| {
+            if (std.mem.eql(u8, &entry.node.id, &node.id)) {
+                return; // Already in bucket
+            }
+        }
+
+        // Add to end if bucket has space
+        if (bucket.entries.items.len < BUCKET_SIZE) {
+            try bucket.entries.append(.{
+                .node = node,
+                .added_at = now,
+                .liveness_checks = 0,
+                .last_seen = now,
+            });
+        } else {
+            // Add to replacements
+            try self.addReplacement(bucket, node, now);
+        }
+    }
+
+    /// Add node to replacement list
+    fn addReplacement(_: *KademliaTable, bucket: *Bucket, node: Node, now: i64) !void {
+        // Check if already in replacements
+        for (bucket.replacements.items) |entry| {
+            if (std.mem.eql(u8, &entry.node.id, &node.id)) {
+                return;
+            }
+        }
+
+        // Add to replacements, maintain max size
+        if (bucket.replacements.items.len >= MAX_REPLACEMENTS) {
+            // Remove oldest replacement
+            _ = bucket.replacements.orderedRemove(bucket.replacements.items.len - 1);
+        }
+
+        try bucket.replacements.insert(0, .{
+            .node = node,
+            .added_at = now,
+            .liveness_checks = 0,
+            .last_seen = now,
+        });
+
+        std.log.debug("Added node to replacement list", .{});
+    }
+
+    /// Get node to revalidate (least recently seen from random bucket)
+    pub fn nodeToRevalidate(self: *KademliaTable) ?Node {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Shuffle bucket indices
+        var indices: [256]usize = undefined;
+        for (&indices, 0..) |*idx, i| {
+            idx.* = i;
+        }
+
+        self.rand.random().shuffle(usize, &indices);
+
+        // Find first non-empty bucket and return last node (least recently seen)
+        for (indices) |bucket_idx| {
+            const bucket = &self.buckets[bucket_idx];
+            if (bucket.entries.items.len > 0) {
+                return bucket.entries.items[bucket.entries.items.len - 1].node;
+            }
+        }
+
+        return null;
+    }
+
+    /// Replace dead node with replacement
+    pub fn replaceDead(self: *KademliaTable, dead_node: Node) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const bucket_idx = self.bucketIndex(&dead_node.id);
+        const bucket = &self.buckets[bucket_idx];
+
+        // Find and remove dead node
+        var found_idx: ?usize = null;
+        for (bucket.entries.items, 0..) |entry, i| {
+            if (std.mem.eql(u8, &entry.node.id, &dead_node.id)) {
+                found_idx = i;
+                break;
+            }
+        }
+
+        if (found_idx) |idx| {
+            // Check it's still at the end (least recently seen position)
+            if (idx == bucket.entries.items.len - 1) {
+                _ = bucket.entries.orderedRemove(idx);
+
+                // Add replacement if available
+                if (bucket.replacements.items.len > 0) {
+                    const replacement = bucket.replacements.orderedRemove(0);
+                    try bucket.entries.append(replacement);
+                    std.log.info("Replaced dead node with replacement", .{});
+                }
+            }
+        }
+    }
+
+    /// Mark bucket as refreshed
+    pub fn markRefreshed(self: *KademliaTable, bucket_idx: usize) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (bucket_idx < self.buckets.len) {
+            self.buckets[bucket_idx].last_refresh = std.time.timestamp();
+        }
+    }
+
+    /// Get buckets that need refreshing
+    /// Returns list of bucket indices that haven't been refreshed recently
+    pub fn refreshCandidates(self: *KademliaTable) ![]usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var candidates = std.ArrayList(usize).init(self.allocator);
+        errdefer candidates.deinit();
+
+        const now = std.time.timestamp();
+        const threshold = now - BUCKET_REFRESH_INTERVAL;
+
+        for (&self.buckets, 0..) |*bucket, i| {
+            if (bucket.last_refresh < threshold) {
+                try candidates.append(i);
+            }
+        }
+
+        return candidates.toOwnedSlice();
     }
 
     /// Find closest nodes to target
     pub fn findClosest(self: *KademliaTable, target: [32]u8, count: usize) ![]Node {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         var candidates = std.ArrayList(Node).init(self.allocator);
         defer candidates.deinit();
 
-        // Collect all nodes
+        // Collect all verified nodes (liveness_checks > 0)
         for (self.buckets) |bucket| {
-            try candidates.appendSlice(bucket.nodes.items);
+            for (bucket.entries.items) |entry| {
+                if (entry.liveness_checks > 0) {
+                    try candidates.append(entry.node);
+                }
+            }
+        }
+
+        // If no verified nodes, collect all nodes
+        if (candidates.items.len == 0) {
+            for (self.buckets) |bucket| {
+                for (bucket.entries.items) |entry| {
+                    try candidates.append(entry.node);
+                }
+            }
         }
 
         // Sort by distance to target
@@ -756,6 +1257,57 @@ pub const KademliaTable = struct {
         // Return top N
         const result_count = @min(count, candidates.items.len);
         return self.allocator.dupe(Node, candidates.items[0..result_count]);
+    }
+
+    /// Get random nodes for dial scheduler
+    pub fn randomNodes(self: *KademliaTable, count: usize) ![]Node {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var all_nodes = std.ArrayList(Node).init(self.allocator);
+        defer all_nodes.deinit();
+
+        // Collect all verified nodes
+        for (self.buckets) |bucket| {
+            for (bucket.entries.items) |entry| {
+                if (entry.liveness_checks > 0) {
+                    try all_nodes.append(entry.node);
+                }
+            }
+        }
+
+        // Shuffle
+        self.rand.random().shuffle(Node, all_nodes.items);
+
+        // Return up to count nodes
+        const result_count = @min(count, all_nodes.items.len);
+        return self.allocator.dupe(Node, all_nodes.items[0..result_count]);
+    }
+
+    pub fn len(self: *KademliaTable) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var total: usize = 0;
+        for (self.buckets) |bucket| {
+            total += bucket.entries.items.len;
+        }
+        return total;
+    }
+
+    pub fn liveCount(self: *KademliaTable) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var count: usize = 0;
+        for (self.buckets) |bucket| {
+            for (bucket.entries.items) |entry| {
+                if (entry.liveness_checks > 0) {
+                    count += 1;
+                }
+            }
+        }
+        return count;
     }
 
     fn bucketIndex(self: *KademliaTable, node_id: *const [32]u8) usize {
@@ -812,16 +1364,16 @@ pub fn encodePacket(
 
     // Sign the packet (signature goes over type + data)
     const to_sign = packet[HEAD_SIZE..];
-    const msg_hash = crypto.keccak256(to_sign);
+    const msg_hash = keccak256(to_sign);
 
     // Generate signature using ECDSA
-    const signature = try crypto.sign(msg_hash, priv_key);
+    const signature = try Crypto.unaudited_signHash(msg_hash, priv_key);
 
     // Copy signature into packet
     @memcpy(packet[MAC_SIZE .. MAC_SIZE + SIG_SIZE], &signature);
 
     // Compute hash over signature + type + data
-    const hash = crypto.keccak256(packet[MAC_SIZE..]);
+    const hash = keccak256(packet[MAC_SIZE..]);
     @memcpy(packet[0..MAC_SIZE], &hash);
 
     return packet;
@@ -844,19 +1396,19 @@ pub fn decodePacket(
     const data = packet[HEAD_SIZE + 1 ..];
 
     // Verify hash
-    const should_hash = crypto.keccak256(packet[MAC_SIZE..]);
+    const should_hash = keccak256(packet[MAC_SIZE..]);
     if (!std.mem.eql(u8, hash, &should_hash)) {
         return DiscoveryError.BadHash;
     }
 
     // Recover public key from signature
     const to_verify = packet[HEAD_SIZE..];
-    const verify_hash = crypto.keccak256(to_verify);
+    const verify_hash = keccak256(to_verify);
 
     var sig_copy: [65]u8 = undefined;
     @memcpy(&sig_copy, signature);
 
-    const from_id = crypto.ecrecover(verify_hash, sig_copy) catch |err| {
+    const from_id = Crypto.unaudited_recoverAddress(verify_hash, sig_copy) catch |err| {
         std.log.warn("Failed to recover public key: {}", .{err});
         return DiscoveryError.BadSignature;
     };

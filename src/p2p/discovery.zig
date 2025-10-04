@@ -814,11 +814,8 @@ pub fn encodePacket(
     const to_sign = packet[HEAD_SIZE..];
     const msg_hash = crypto.keccak256(to_sign);
 
-    // Generate signature using private key
-    // For now, use simplified signature (TODO: proper ECDSA)
-    var signature: [65]u8 = undefined;
-    @memset(&signature, 0);
-    @memcpy(signature[0..32], &msg_hash); // Placeholder
+    // Generate signature using ECDSA
+    const signature = try crypto.sign(msg_hash, priv_key);
 
     // Copy signature into packet
     @memcpy(packet[MAC_SIZE .. MAC_SIZE + SIG_SIZE], &signature);
@@ -853,9 +850,16 @@ pub fn decodePacket(
     }
 
     // Recover public key from signature
-    // TODO: Implement proper signature recovery
-    var from_id: [64]u8 = undefined;
-    @memset(&from_id, 0); // Placeholder
+    const to_verify = packet[HEAD_SIZE..];
+    const verify_hash = crypto.keccak256(to_verify);
+
+    var sig_copy: [65]u8 = undefined;
+    @memcpy(&sig_copy, signature);
+
+    const from_id = crypto.ecrecover(verify_hash, sig_copy) catch |err| {
+        std.log.warn("Failed to recover public key: {}", .{err});
+        return DiscoveryError.BadSignature;
+    };
 
     // Parse packet type
     const packet_type: PacketType = @enumFromInt(packet_type_byte);

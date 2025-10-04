@@ -283,10 +283,37 @@ pub const Server = struct {
         }
     }
 
-    /// Dial a node
+    /// Dial a node with retry logic
     fn dialNode(self: *Self, node: discovery.Node) !void {
-        // Create TCP connection
-        const stream = try std.net.tcpConnectToAddress(node.ip);
+        const max_retries = 3;
+        var retry_count: u32 = 0;
+        var backoff_ms: u64 = 100; // Start with 100ms backoff
+
+        while (retry_count < max_retries) : (retry_count += 1) {
+            const result = self.attemptDial(node);
+
+            if (result) |_| {
+                return; // Success
+            } else |err| {
+                std.log.warn("Dial attempt {} failed: {}", .{ retry_count + 1, err });
+
+                if (retry_count < max_retries - 1) {
+                    std.time.sleep(backoff_ms * std.time.ns_per_ms);
+                    backoff_ms *= 2; // Exponential backoff
+                }
+            }
+        }
+
+        return error.DialFailed;
+    }
+
+    /// Attempt to dial a node once
+    fn attemptDial(self: *Self, node: discovery.Node) !void {
+        // Create TCP connection with timeout
+        const stream = std.net.tcpConnectToAddress(node.ip) catch |err| {
+            std.log.debug("TCP connection failed: {}", .{err});
+            return err;
+        };
         errdefer stream.close();
 
         // Create RLPx connection (initiator side)
@@ -294,7 +321,11 @@ pub const Server = struct {
         var rlpx_conn = rlpx.Conn.init(self.allocator, stream, remote_pub);
 
         // Perform RLPx handshake
-        try rlpx_conn.handshake(&self.config.priv_key);
+        rlpx_conn.handshake(&self.config.priv_key) catch |err| {
+            std.log.debug("RLPx handshake failed: {}", .{err});
+            stream.close();
+            return err;
+        };
 
         // Create peer
         const peer = try Peer.init(
@@ -303,9 +334,14 @@ pub const Server = struct {
             .outbound,
             self.config.protocols,
         );
+        errdefer peer.deinit();
 
         // Perform devp2p handshake
-        try peer.doHandshake(self.config.name, self.config.priv_key);
+        peer.doHandshake(self.config.name, self.config.priv_key) catch |err| {
+            std.log.debug("DevP2P handshake failed: {}", .{err});
+            peer.deinit();
+            return err;
+        };
 
         // Add to peer list
         try self.addPeer(peer);
@@ -313,6 +349,8 @@ pub const Server = struct {
         // Run peer in separate thread
         const peer_thread = try std.Thread.spawn(.{}, runPeerThread, .{ self, peer });
         peer_thread.detach();
+
+        std.log.info("Successfully connected to peer", .{});
     }
 
     fn runPeerThread(self: *Self, peer: *Peer) !void {
@@ -380,9 +418,12 @@ pub const Peer = struct {
         self.allocator.destroy(self);
     }
 
-    /// Perform devp2p handshake
+    /// Perform devp2p handshake with timeout
     pub fn doHandshake(self: *Self, client_name: []const u8, priv_key: [32]u8) !void {
         _ = priv_key;
+
+        const start_time = std.time.timestamp();
+        self.state = .handshaking;
 
         if (self.direction == .outbound) {
             // Send Hello message
@@ -392,14 +433,22 @@ pub const Peer = struct {
             const hello_payload = try hello.encode(self.allocator);
             defer self.allocator.free(hello_payload);
 
-            try self.conn.writeMsg(@intFromEnum(devp2p.MessageType.hello), hello_payload);
+            try self.conn.writeMsg(@intFromEnum(devp2p.BaseMessageType.hello), hello_payload);
         }
 
-        // Receive Hello
+        // Receive Hello with timeout
         const msg = try self.conn.readMsg();
         defer self.allocator.free(msg.payload);
 
-        if (msg.code != @intFromEnum(devp2p.MessageType.hello)) {
+        // Check timeout
+        const elapsed = std.time.timestamp() - start_time;
+        if (elapsed > HANDSHAKE_TIMEOUT) {
+            self.state = .disconnected;
+            return error.HandshakeTimeout;
+        }
+
+        if (msg.code != @intFromEnum(devp2p.BaseMessageType.hello)) {
+            self.state = .disconnected;
             return error.ExpectedHello;
         }
 
@@ -416,30 +465,99 @@ pub const Peer = struct {
             const hello_payload = try our_hello.encode(self.allocator);
             defer self.allocator.free(hello_payload);
 
-            try self.conn.writeMsg(@intFromEnum(devp2p.MessageType.hello), hello_payload);
+            try self.conn.writeMsg(@intFromEnum(devp2p.BaseMessageType.hello), hello_payload);
         }
 
         // Enable snappy compression if both sides support it
         self.conn.setSnappy(true);
+        self.state = .active;
+
+        std.log.info("Handshake completed with peer: {s}", .{self.name});
     }
 
-    /// Run peer message loop
+    /// Run peer message loop with keepalive
     pub fn run(self: *Self) !void {
         self.running = true;
+        var last_keepalive_check = std.time.timestamp();
 
-        while (self.running) {
+        while (self.running and self.state == .active) {
+            // Check if we need to send keepalive ping
+            const now = std.time.timestamp();
+            if (now - last_keepalive_check > PING_INTERVAL) {
+                try self.sendPing();
+                last_keepalive_check = now;
+            }
+
+            // Check for pong timeout
+            if (now - self.last_pong > PONG_TIMEOUT) {
+                std.log.warn("Peer timeout: no pong received", .{});
+                self.disconnect(.timeout);
+                break;
+            }
+
             const msg = self.conn.readMsg() catch |err| {
                 if (err == error.WouldBlock) {
                     std.time.sleep(10 * std.time.ns_per_ms);
                     continue;
                 }
                 std.log.err("Peer read error: {}", .{err});
+                self.disconnect(.tcp_error);
                 break;
             };
             defer self.allocator.free(msg.payload);
 
-            // Dispatch to protocol handler
-            try self.handleMessage(msg.code, msg.payload);
+            // Handle base protocol messages
+            if (msg.code <= 0x03) {
+                try self.handleBaseMessage(msg.code, msg.payload);
+            } else {
+                // Dispatch to protocol handler
+                try self.handleMessage(msg.code, msg.payload);
+            }
+        }
+    }
+
+    /// Send keepalive ping
+    fn sendPing(self: *Self) !void {
+        // Empty ping message
+        try self.conn.writeMsg(@intFromEnum(devp2p.BaseMessageType.ping), &[_]u8{});
+        self.last_ping = std.time.timestamp();
+        std.log.debug("Sent keepalive ping to peer", .{});
+    }
+
+    /// Send pong response
+    fn sendPong(self: *Self) !void {
+        try self.conn.writeMsg(@intFromEnum(devp2p.BaseMessageType.pong), &[_]u8{});
+        std.log.debug("Sent pong to peer", .{});
+    }
+
+    /// Handle base devp2p messages (ping/pong/disconnect)
+    fn handleBaseMessage(self: *Self, code: u64, payload: []const u8) !void {
+        const base_type: devp2p.BaseMessageType = @enumFromInt(code);
+
+        switch (base_type) {
+            .hello => {
+                // Hello should only arrive during handshake
+                std.log.warn("Unexpected Hello message", .{});
+            },
+            .disconnect => {
+                var decoder = rlp.Decoder.init(payload);
+                var list = try decoder.enterList();
+                const reason_code: u8 = @intCast(try list.decodeInt());
+                const reason: devp2p.DisconnectReason = @enumFromInt(reason_code);
+
+                std.log.info("Peer disconnected: {}", .{reason});
+                self.disconnect_reason = reason;
+                self.running = false;
+            },
+            .ping => {
+                // Respond with pong
+                try self.sendPong();
+            },
+            .pong => {
+                // Update last pong time
+                self.last_pong = std.time.timestamp();
+                std.log.debug("Received pong from peer", .{});
+            },
         }
     }
 
@@ -456,16 +574,32 @@ pub const Peer = struct {
         std.log.warn("Unknown message code: {}", .{code});
     }
 
+    /// Gracefully disconnect from peer
     pub fn disconnect(self: *Self, reason: devp2p.DisconnectReason) void {
+        if (self.state == .disconnecting or self.state == .disconnected) {
+            return;
+        }
+
+        self.state = .disconnecting;
+        self.disconnect_reason = reason;
+
+        std.log.info("Disconnecting peer {s}: {}", .{ self.name, reason });
+
         // Send disconnect message
         const disconnect = devp2p.Disconnect{ .reason = reason };
         const payload = disconnect.encode(self.allocator) catch {
+            self.state = .disconnected;
             self.running = false;
             return;
         };
         defer self.allocator.free(payload);
 
-        self.conn.writeMsg(@intFromEnum(devp2p.MessageType.disconnect), payload) catch {};
+        self.conn.writeMsg(@intFromEnum(devp2p.BaseMessageType.disconnect), payload) catch {};
+
+        // Allow some time for message to be sent
+        std.time.sleep(100 * std.time.ns_per_ms);
+
+        self.state = .disconnected;
         self.running = false;
     }
 };

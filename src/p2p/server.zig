@@ -471,14 +471,14 @@ pub const Server = struct {
     pub fn addTrustedPeer(self: *Self, node: discovery.Node) !void {
         self.add_trusted_mutex.lock();
         defer self.add_trusted_mutex.unlock();
-        try self.add_trusted_queue.append(node);
+        try self.add_trusted_queue.append(self.allocator, node);
     }
 
     /// Remove trusted peer
     pub fn removeTrustedPeer(self: *Self, node: discovery.Node) !void {
         self.remove_trusted_mutex.lock();
         defer self.remove_trusted_mutex.unlock();
-        try self.remove_trusted_queue.append(node);
+        try self.remove_trusted_queue.append(self.allocator, node);
     }
 
     /// Add static peer (always maintain connection)

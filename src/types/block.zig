@@ -48,9 +48,9 @@ pub const Bloom = struct {
         const idx2 = BLOOM_BYTE_LENGTH - ((std.mem.readInt(u16, hash_buf[2..4], .big) & 0x7ff) >> 3) - 1;
         const idx3 = BLOOM_BYTE_LENGTH - ((std.mem.readInt(u16, hash_buf[4..6], .big) & 0x7ff) >> 3) - 1;
 
-        const v1: u8 = 1 << @as(u3, @intCast(hash_buf[0] & 0x7));
-        const v2: u8 = 1 << @as(u3, @intCast(hash_buf[2] & 0x7));
-        const v3: u8 = 1 << @as(u3, @intCast(hash_buf[4] & 0x7));
+        const v1: u8 = @as(u8, 1) << @as(u3, @intCast(hash_buf[0] & 0x7));
+        const v2: u8 = @as(u8, 1) << @as(u3, @intCast(hash_buf[2] & 0x7));
+        const v3: u8 = @as(u8, 1) << @as(u3, @intCast(hash_buf[4] & 0x7));
 
         self.bytes[idx1] |= v1;
         self.bytes[idx2] |= v2;
@@ -66,9 +66,9 @@ pub const Bloom = struct {
         const idx2 = BLOOM_BYTE_LENGTH - ((std.mem.readInt(u16, hash_buf[2..4], .big) & 0x7ff) >> 3) - 1;
         const idx3 = BLOOM_BYTE_LENGTH - ((std.mem.readInt(u16, hash_buf[4..6], .big) & 0x7ff) >> 3) - 1;
 
-        const v1: u8 = 1 << @as(u3, @intCast(hash_buf[0] & 0x7));
-        const v2: u8 = 1 << @as(u3, @intCast(hash_buf[2] & 0x7));
-        const v3: u8 = 1 << @as(u3, @intCast(hash_buf[4] & 0x7));
+        const v1: u8 = @as(u8, 1) << @as(u3, @intCast(hash_buf[0] & 0x7));
+        const v2: u8 = @as(u8, 1) << @as(u3, @intCast(hash_buf[2] & 0x7));
+        const v3: u8 = @as(u8, 1) << @as(u3, @intCast(hash_buf[4] & 0x7));
 
         return (self.bytes[idx1] & v1) == v1 and
             (self.bytes[idx2] & v2) == v2 and

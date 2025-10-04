@@ -114,6 +114,7 @@ pub fn build(b: *std.Build) void {
     // Add guillotine modules to the client module
     mod.addImport("guillotine_evm", guillotine_evm_mod);
     mod.addImport("guillotine_primitives", guillotine_primitives_mod);
+    mod.addImport("crypto", guillotine_crypto_mod);
     // Also add as "primitives" for client code compatibility
     mod.addImport("primitives", guillotine_primitives_mod);
 
@@ -166,6 +167,7 @@ pub fn build(b: *std.Build) void {
     // Add guillotine modules to the executable
     exe.root_module.addImport("guillotine_evm", guillotine_evm_mod);
     exe.root_module.addImport("guillotine_primitives", guillotine_primitives_mod);
+    exe.root_module.addImport("crypto", guillotine_crypto_mod);
     // Also add as "primitives" for code that imports it directly
     exe.root_module.addImport("primitives", guillotine_primitives_mod);
 

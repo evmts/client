@@ -211,12 +211,56 @@ pub const SnapshotManager = struct {
                 block_num >= segment.from_block and
                 block_num < segment.to_block)
             {
-                // In production: memory-map file, decompress, seek to block
+                // Production implementation: Memory-map file, decompress, seek to block
+                // Based on erigon/db/seg/decompress.go:Decompressor
+                //
+                // Key steps in production:
+                // 1. Memory-map the segment file (mmap.Mmap)
+                //    - Opens file with os.Open
+                //    - Maps entire file into virtual memory
+                //    - Zero-copy access to compressed data
+                //    - OS handles paging from disk as needed
+                //
+                // 2. Parse file header:
+                //    - wordsCount (u64): total number of entries
+                //    - emptyWordsCount (u64): count of empty entries
+                //    - dictSize (u64): size of compression dictionary
+                //
+                // 3. Load compression dictionary:
+                //    - Pattern table for Huffman-like decompression
+                //    - Builds condensed lookup tables (bitLen typically 9)
+                //    - Position dictionary for offset calculations
+                //    - Max depth validation (must be <= maxAllowedDepth)
+                //
+                // 4. Decompress entry:
+                //    - Calculate offset using position table
+                //    - Decode using pattern dictionary
+                //    - Supports streaming decompression for large entries
+                //    - Handles both empty and non-empty words
+                //
+                // 5. Compression format (Erigon's custom):
+                //    - Uses pattern/position dictionaries (not standard zstd)
+                //    - Optimized for blockchain data (high redundancy)
+                //    - Typical compression ratio: 5-10x
+                //    - Fast random access via position index
+                //
+                // File structure:
+                // [Header: wordsCount, emptyWordsCount]
+                // [Dictionary: patterns with depths]
+                // [Position table: offsets and lengths]
+                // [Compressed data: encoded superstrings]
+                //
+                // For random access to block N:
+                // 1. Look up position in position dictionary
+                // 2. Seek to that offset in compressed data
+                // 3. Decode entry using pattern dictionary
+                // 4. Return decompressed block data
+
                 std.log.debug("Would read header {} from snapshot {s}", .{
                     block_num,
                     segment.file_path,
                 });
-                return null; // Simplified
+                return null; // Simplified for now - full implementation requires mmap + decompressor
             }
         }
         return null;

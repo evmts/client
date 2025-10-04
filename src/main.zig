@@ -75,7 +75,7 @@ pub const Client = struct {
 
         // Start P2P network
         if (self.network) |*network| {
-            try network.start(self.config.p2p_port);
+            try network.start();
         }
 
         // Start node sync
@@ -114,7 +114,52 @@ pub fn main() !void {
     std.log.info("Client running. Press Ctrl+C to stop.", .{});
 
     // In production: Handle signals and run event loop
-    // For minimal implementation: Exit after sync
+    // Setup signal handling for graceful shutdown
+    var shutdown_requested = std.atomic.Value(bool).init(false);
+
+    // Platform-specific signal handling
+    if (@import("builtin").os.tag != .windows) {
+        // Setup SIGINT (Ctrl+C) and SIGTERM handlers
+        const sigaction = std.posix.Sigaction{
+            .handler = .{ .handler = handleSignal },
+            .mask = std.posix.empty_sigset,
+            .flags = 0,
+        };
+
+        try std.posix.sigaction(std.posix.SIG.INT, &sigaction, null);
+        try std.posix.sigaction(std.posix.SIG.TERM, &sigaction, null);
+
+        // Store shutdown flag in thread-local storage for signal handler
+        shutdown_flag = &shutdown_requested;
+    }
+
+    // Main event loop - keep running until shutdown requested
+    while (!shutdown_requested.load(.acquire)) {
+        // Sleep briefly to avoid busy-waiting
+        std.time.sleep(100 * std.time.ns_per_ms);
+
+        // In a full implementation, this loop would:
+        // 1. Process background tasks
+        // 2. Handle network events
+        // 3. Monitor sync progress
+        // 4. Respond to RPC requests (already handled in separate thread)
+    }
+
+    // Graceful shutdown
+    std.log.info("Shutdown signal received, stopping client...", .{});
+    client.stop();
+    std.log.info("Client stopped successfully", .{});
+}
+
+// Thread-local storage for shutdown flag (used by signal handler)
+threadlocal var shutdown_flag: ?*std.atomic.Value(bool) = null;
+
+/// Signal handler for SIGINT and SIGTERM
+fn handleSignal(sig: c_int) callconv(.C) void {
+    _ = sig;
+    if (shutdown_flag) |flag| {
+        flag.store(true, .release);
+    }
 }
 
 test "client initialization" {

@@ -43,6 +43,9 @@ pub const stages = struct {
     pub const execution = @import("stages/execution.zig");
 };
 
+// Export consensus
+pub const consensus = @import("consensus/consensus.zig");
+
 // Re-export common types
 pub const Header = chain.Header;
 pub const Transaction = chain.Transaction;

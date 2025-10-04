@@ -375,6 +375,165 @@ pub fn verifySignature(
     return std.mem.eql(u8, &recovered.bytes, &expected_address.bytes);
 }
 
+/// Sign a message hash with a private key
+/// Returns 65-byte signature: [r(32) || s(32) || v(1)]
+/// Based on Ethereum's ECDSA signing (secp256k1)
+pub fn sign(message_hash: [32]u8, private_key: [32]u8) ![65]u8 {
+    // Convert private key to scalar
+    const d = std.mem.readInt(u256, &private_key, .big);
+    if (d == 0 or d >= SECP256K1_N) return error.InvalidPrivateKey;
+
+    // Convert message hash to scalar
+    const z = std.mem.readInt(u256, &message_hash, .big);
+
+    // Generate deterministic k using RFC 6979 (simplified version)
+    // In production, should use proper RFC 6979
+    var k_bytes: [32]u8 = undefined;
+    @memcpy(&k_bytes, &message_hash);
+
+    // Mix in private key for determinism
+    for (k_bytes, 0..) |*byte, i| {
+        byte.* ^= private_key[i];
+    }
+
+    const k_hash = keccak256(&k_bytes);
+    var k = std.mem.readInt(u256, &k_hash, .big);
+
+    // Ensure k is in valid range
+    k = (k % (SECP256K1_N - 1)) + 1;
+
+    // Calculate R = k * G
+    const R = AffinePoint.generator().scalar_mul(k);
+    if (R.infinity) return error.InvalidSignature;
+
+    // r = R.x mod n
+    const r = R.x % SECP256K1_N;
+    if (r == 0) return error.InvalidSignature;
+
+    // Calculate s = k⁻¹ * (z + r * d) mod n
+    const k_inv = invmod(k, SECP256K1_N) orelse return error.InvalidSignature;
+    const rd = mulmod(r, d, SECP256K1_N);
+    const z_plus_rd = addmod(z, rd, SECP256K1_N);
+    var s = mulmod(k_inv, z_plus_rd, SECP256K1_N);
+
+    // Enforce low s value to prevent malleability (EIP-2)
+    const half_n = SECP256K1_N >> 1;
+    var recovery_id: u8 = 0;
+    if (s > half_n) {
+        s = SECP256K1_N - s;
+        recovery_id = 1;
+    }
+
+    // Build signature: [r(32) || s(32) || v(1)]
+    var signature: [65]u8 = undefined;
+    std.mem.writeInt(u256, signature[0..32], r, .big);
+    std.mem.writeInt(u256, signature[32..64], s, .big);
+    signature[64] = recovery_id;
+
+    return signature;
+}
+
+/// Recover public key from signature (ecrecover)
+/// Returns uncompressed public key (64 bytes, without 0x04 prefix)
+/// This is the function Discovery v4 needs for packet verification
+pub fn ecrecover(message_hash: [32]u8, signature: [65]u8) ![64]u8 {
+    // Extract r, s, v from signature
+    var r_bytes: [32]u8 = undefined;
+    var s_bytes: [32]u8 = undefined;
+    @memcpy(&r_bytes, signature[0..32]);
+    @memcpy(&s_bytes, signature[32..64]);
+    const recovery_id = signature[64];
+
+    if (recovery_id > 1) return error.InvalidRecoveryId;
+
+    const r = std.mem.readInt(u256, &r_bytes, .big);
+    const s = std.mem.readInt(u256, &s_bytes, .big);
+
+    // Validate signature
+    if (!validate_signature(r, s)) return error.InvalidSignature;
+
+    const e = std.mem.readInt(u256, &message_hash, .big);
+
+    // Calculate R point from r
+    // R.x = r (or r + n if recovery_id indicates)
+    var R_x = r;
+    if (recovery_id >= 2) {
+        R_x = r + SECP256K1_N;
+        if (R_x >= SECP256K1_P) return error.InvalidSignature;
+    }
+
+    // Calculate R.y from R.x (two possible values)
+    const y_squared = addmod(
+        addmod(
+            mulmod(mulmod(R_x, R_x, SECP256K1_P), R_x, SECP256K1_P),
+            SECP256K1_B,
+            SECP256K1_P
+        ),
+        0,
+        SECP256K1_P
+    );
+
+    // Find y using Tonelli-Shanks (square root mod p)
+    const y = sqrtmod(y_squared, SECP256K1_P) orelse return error.InvalidSignature;
+
+    // Choose correct y based on recovery_id parity
+    const R_y = if ((y & 1) == (recovery_id & 1)) y else SECP256K1_P - y;
+
+    var R = AffinePoint{ .x = R_x, .y = R_y, .infinity = false };
+    if (!R.is_on_curve()) return error.InvalidSignature;
+
+    // Calculate public key: Q = r⁻¹ * (s*R - e*G)
+    const r_inv = invmod(r, SECP256K1_N) orelse return error.InvalidSignature;
+    const s_R = R.scalar_mul(s);
+    const e_G = AffinePoint.generator().scalar_mul(e);
+    const neg_e_G = AffinePoint{ .x = e_G.x, .y = SECP256K1_P - e_G.y, .infinity = e_G.infinity };
+    const s_R_minus_e_G = s_R.add(neg_e_G);
+    const Q = s_R_minus_e_G.scalar_mul(r_inv);
+
+    if (Q.infinity) return error.InvalidSignature;
+
+    // Return uncompressed public key (64 bytes)
+    var pub_key: [64]u8 = undefined;
+    std.mem.writeInt(u256, pub_key[0..32], Q.x, .big);
+    std.mem.writeInt(u256, pub_key[32..64], Q.y, .big);
+
+    return pub_key;
+}
+
+/// Square root modulo p (Tonelli-Shanks algorithm)
+/// Only works for p ≡ 3 (mod 4) like secp256k1's p
+fn sqrtmod(a: u256, p: u256) ?u256 {
+    // For p ≡ 3 (mod 4), sqrt(a) = a^((p+1)/4) mod p
+    // secp256k1 p = 2^256 - 2^32 - 977 ≡ 3 (mod 4)
+    const exp = (p + 1) / 4;
+    const result = powmod(a, exp, p);
+
+    // Verify result
+    if (mulmod(result, result, p) == a) {
+        return result;
+    }
+    return null;
+}
+
+/// Modular exponentiation: base^exp mod m
+fn powmod(base: u256, exp: u256, m: u256) u256 {
+    if (m == 1) return 0;
+
+    var result: u256 = 1;
+    var b = base % m;
+    var e = exp;
+
+    while (e > 0) {
+        if (e & 1 == 1) {
+            result = mulmod(result, b, m);
+        }
+        e >>= 1;
+        b = mulmod(b, b, m);
+    }
+
+    return result;
+}
+
 test "keccak256" {
     const data = "hello";
     const hash = keccak256(data);
@@ -743,4 +902,46 @@ test "ECIES shared secret" {
     const shared2 = try ECIES.generateShared(priv2, pub1);
 
     try std.testing.expectEqualSlices(u8, &shared1, &shared2);
+}
+
+test "ECDSA sign and ecrecover" {
+    // Generate test private key
+    var priv_key: [32]u8 = undefined;
+    @memset(&priv_key, 0);
+    priv_key[31] = 1; // Simple test key
+
+    // Derive public key
+    const d = std.mem.readInt(u256, &priv_key, .big);
+    const pub_point = AffinePoint.generator().scalar_mul(d);
+    var expected_pub: [64]u8 = undefined;
+    std.mem.writeInt(u256, expected_pub[0..32], pub_point.x, .big);
+    std.mem.writeInt(u256, expected_pub[32..64], pub_point.y, .big);
+
+    // Create test message
+    const message = "Hello, Ethereum!";
+    const msg_hash = keccak256(message);
+
+    // Sign message
+    const signature = try sign(msg_hash, priv_key);
+
+    // Recover public key
+    const recovered_pub = try ecrecover(msg_hash, signature);
+
+    // Verify recovered public key matches original
+    try std.testing.expectEqualSlices(u8, &expected_pub, &recovered_pub);
+}
+
+test "ECDSA sign deterministic" {
+    // Same message and key should produce same signature
+    var priv_key: [32]u8 = undefined;
+    @memset(&priv_key, 0);
+    priv_key[31] = 42;
+
+    const msg_hash = keccak256("test message");
+
+    const sig1 = try sign(msg_hash, priv_key);
+    const sig2 = try sign(msg_hash, priv_key);
+
+    // Signatures should be identical (deterministic signing)
+    try std.testing.expectEqualSlices(u8, &sig1, &sig2);
 }

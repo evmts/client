@@ -219,6 +219,10 @@ pub const Transaction = union(TxType) {
                 _ = chain_id; // dynamic_fee has its own chain_id
                 return try tx.signingHash(allocator);
             },
+            .blob => |tx| {
+                _ = chain_id; // blob has its own chain_id
+                return try tx.signingHash(allocator);
+            },
         };
     }
 
@@ -228,6 +232,7 @@ pub const Transaction = union(TxType) {
             .legacy => |tx| .{ .legacy = try tx.clone(allocator) },
             .access_list => |tx| .{ .access_list = try tx.clone(allocator) },
             .dynamic_fee => |tx| .{ .dynamic_fee = try tx.clone(allocator) },
+            .blob => |tx| .{ .blob = try tx.clone(allocator) },
         };
     }
 
@@ -237,6 +242,7 @@ pub const Transaction = union(TxType) {
             .legacy => |*tx| tx.deinit(allocator),
             .access_list => |*tx| tx.deinit(allocator),
             .dynamic_fee => |*tx| tx.deinit(allocator),
+            .blob => |*tx| tx.deinit(allocator),
         }
     }
 
@@ -267,6 +273,7 @@ pub const Transaction = union(TxType) {
             .legacy => |tx| try tx.encodeRlp(allocator),
             .access_list => |tx| try tx.encode(allocator),
             .dynamic_fee => |tx| try tx.encode(allocator),
+            .blob => |tx| try tx.encode(allocator),
         };
     }
 };

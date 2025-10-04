@@ -160,7 +160,7 @@ pub const Transaction = union(TxType) {
             .legacy => |tx| tx.getChainId(),
             .access_list => |tx| tx.chain_id,
             .dynamic_fee => |tx| tx.chain_id,
-            // .blob => |tx| tx.chain_id,
+            .blob => |tx| tx.dynamic_fee.chain_id,
             // .set_code => |tx| tx.chain_id,
             // .account_abstraction => null,
         };

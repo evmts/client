@@ -10,6 +10,7 @@ pub const access_list = @import("access_list.zig");
 pub const state_object = @import("state_object.zig");
 pub const transient_storage = @import("transient_storage.zig");
 pub const journal = @import("journal.zig");
+pub const precompiles = @import("precompiles.zig");
 pub const execution = @import("execution.zig");
 pub const sync = @import("sync.zig");
 pub const node = @import("node.zig");

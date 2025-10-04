@@ -346,6 +346,153 @@ pub fn opSar(stack: *Stack) !void {
     }
 }
 
+/// Stack Manipulation Instructions (0x50, 0x60-0x9f range)
+
+/// POP: Remove item from stack
+/// Stack: x => (nothing)
+pub fn opPop(stack: *Stack) !void {
+    _ = try stack.pop();
+}
+
+/// PUSH0: Push 0 onto stack (EIP-3855)
+/// Stack: => 0
+pub fn opPush0(stack: *Stack) !void {
+    try stack.push(0);
+}
+
+/// PUSH1-PUSH32: Push N bytes onto stack
+/// Stack: => value (from immediate data)
+pub fn opPush(stack: *Stack, data: []const u8, size: u8) !void {
+    if (size > data.len) {
+        return error.InvalidPushSize;
+    }
+
+    var value: u256 = 0;
+    for (data[0..size]) |byte| {
+        value = (value << 8) | byte;
+    }
+    try stack.push(value);
+}
+
+/// Memory Instructions (0x51-0x5e range)
+
+/// MLOAD: Load word from memory
+/// Stack: offset => value
+pub fn opMload(stack: *Stack, memory: *Memory) !void {
+    const offset = try stack.pop();
+    const value = try memory.get32(offset);
+    try stack.push(value);
+}
+
+/// MSTORE: Store word to memory
+/// Stack: offset, value => (nothing)
+pub fn opMstore(stack: *Stack, memory: *Memory) !void {
+    const offset = try stack.pop();
+    const value = try stack.pop();
+    try memory.set32(offset, value);
+}
+
+/// MSTORE8: Store byte to memory
+/// Stack: offset, value => (nothing)
+pub fn opMstore8(stack: *Stack, memory: *Memory) !void {
+    const offset = try stack.pop();
+    const value = try stack.pop();
+
+    const offset_usize: usize = @intCast(@min(offset, std.math.maxInt(usize)));
+    if (offset_usize < memory.len()) {
+        const byte_val: u8 = @intCast(value & 0xFF);
+        try memory.set(offset, 1, &[_]u8{byte_val});
+    }
+}
+
+/// MSIZE: Get size of active memory in bytes
+/// Stack: => size
+pub fn opMsize(stack: *Stack, memory: *const Memory) !void {
+    try stack.push(memory.len());
+}
+
+/// MCOPY: Copy memory (EIP-5656)
+/// Stack: dst, src, length => (nothing)
+pub fn opMcopy(stack: *Stack, memory: *Memory) !void {
+    const dst = try stack.pop();
+    const src = try stack.pop();
+    const length = try stack.pop();
+    try memory.copyMem(dst, src, length);
+}
+
+/// Hashing Instructions
+
+/// KECCAK256: Compute Keccak-256 hash
+/// Stack: offset, length => hash
+pub fn opKeccak256(stack: *Stack, memory: *const Memory, allocator: std.mem.Allocator) !void {
+    const offset = try stack.pop();
+    const length = try stack.pop();
+
+    if (length == 0) {
+        // Hash of empty data
+        const empty_hash: u256 = 0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470;
+        try stack.push(empty_hash);
+        return;
+    }
+
+    const data = try memory.getCopy(offset, length, allocator);
+    defer allocator.free(data);
+
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha3.Keccak256.hash(data, &hash, .{});
+
+    const hash_value = std.mem.readInt(u256, &hash, .big);
+    try stack.push(hash_value);
+}
+
+/// Control Flow Instructions
+
+/// PC: Program counter
+/// Stack: => counter
+pub fn opPc(stack: *Stack, pc: u64) !void {
+    try stack.push(pc);
+}
+
+/// JUMP: Unconditional jump
+/// Stack: destination => (nothing)
+/// Returns new PC value
+pub fn opJump(stack: *Stack) !u64 {
+    const dest = try stack.pop();
+    if (dest > std.math.maxInt(u64)) {
+        return error.InvalidJump;
+    }
+    return @intCast(dest);
+}
+
+/// JUMPI: Conditional jump
+/// Stack: destination, condition => (nothing)
+/// Returns new PC value or null if no jump
+pub fn opJumpi(stack: *Stack) !?u64 {
+    const dest = try stack.pop();
+    const condition = try stack.pop();
+
+    if (condition != 0) {
+        if (dest > std.math.maxInt(u64)) {
+            return error.InvalidJump;
+        }
+        return @intCast(dest);
+    }
+    return null;
+}
+
+/// JUMPDEST: Jump destination (marker, does nothing)
+pub fn opJumpdest() void {
+    // This is just a marker, does nothing
+}
+
+/// Miscellaneous Instructions
+
+/// GAS: Get remaining gas
+/// Stack: => gas
+pub fn opGas(stack: *Stack, gas: u64) !void {
+    try stack.push(gas);
+}
+
 // Tests
 test "arithmetic instructions" {
     const testing = std.testing;

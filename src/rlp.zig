@@ -496,3 +496,65 @@ test "decode list" {
 
     try std.testing.expect(list_decoder.isEmpty());
 }
+
+// Import U256 for encoding
+const primitives = @import("primitives");
+const U256 = primitives.U256;
+
+/// Calculate length of integer encoding excluding RLP header
+pub fn intLenExcludingHead(value: u64) usize {
+    if (value == 0) return 0;
+    if (value < 128) return 0; // Single byte values don't need length prefix
+
+    // Count bytes needed for big-endian encoding
+    var v = value;
+    var len: usize = 0;
+    while (v > 0) {
+        len += 1;
+        v >>= 8;
+    }
+    return len;
+}
+
+/// Calculate length of U256 encoding excluding RLP header
+pub fn u256LenExcludingHead(value: U256) usize {
+    if (value.isZero()) return 0;
+
+    const bytes = value.toBytes();
+    // Find first non-zero byte
+    var start: usize = 0;
+    while (start < 32 and bytes[start] == 0) {
+        start += 1;
+    }
+
+    const len = 32 - start;
+    if (len == 1 and bytes[start] < 128) return 0;
+    return len;
+}
+
+/// Calculate string/bytes length with RLP prefix
+pub fn stringLen(data: []const u8) usize {
+    if (data.len == 0) {
+        return 1; // Empty string is 0x80
+    }
+    if (data.len == 1 and data[0] < 128) {
+        return 1; // Single byte < 0x80 encodes as itself
+    }
+    if (data.len <= 55) {
+        return 1 + data.len; // Prefix + data
+    }
+
+    // Long string
+    const len_bytes = encodeLengthSize(data.len);
+    return 1 + len_bytes + data.len;
+}
+
+fn encodeLengthSize(length: usize) usize {
+    var len = length;
+    var size: usize = 0;
+    while (len > 0) {
+        size += 1;
+        len >>= 8;
+    }
+    return size;
+}

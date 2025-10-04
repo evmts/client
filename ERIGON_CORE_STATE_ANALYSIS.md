@@ -46,14 +46,16 @@ type stateObject struct {
 **Key Methods:**
 - `GetState(key) -> value` - Get storage with dirty cache check
 - `GetCommittedState(key) -> value` - Get original storage
-- `SetState(key, value)` - Set storage with journaling
-- `AddBalance(amount)` - Add to balance with journal
-- `SubBalance(amount)` - Subtract from balance with journal
-- `SetNonce(nonce)` - Set nonce with journal
-- `SetCode(code)` - Set code with journal
-- `Balance()`, `Nonce()`, `Code()` - Getters
-- `markSelfdestructed()` - Mark for deletion
-- `deepCopy()` - Clone for snapshots
+- `SetState(key, value)` - Set storage with journaling (includes wasCommited flag)
+- `SetStorage(storage)` - Debug mode: replace entire storage with fake storage
+- `updateStotage(writer)` - Flush dirty storage to database
+- `SetBalance(amount, wasCommited, reason)` - Set balance with journal and tracing
+- `SetCode(codeHash, code, wasCommited)` - Set code with journal and tracing
+- `SetNonce(nonce, wasCommited)` - Set nonce with journal and tracing
+- `Balance()`, `Nonce()`, `Code()` - Getters (Code() lazy loads from DB)
+- `Address()` - Get account address
+- `IsDirty()` - Check if object has uncommitted changes
+- `setIncarnation(incarnation)` - Set account incarnation for contract recreation
 
 **Storage Cache Strategy:**
 - `dirtyStorage`: Modified in current transaction

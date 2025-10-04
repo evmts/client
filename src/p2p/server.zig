@@ -321,6 +321,14 @@ pub const Server = struct {
     }
 };
 
+/// Peer connection state
+pub const PeerState = enum {
+    handshaking,
+    active,
+    disconnecting,
+    disconnected,
+};
+
 /// Peer connection
 pub const Peer = struct {
     allocator: std.mem.Allocator,
@@ -329,6 +337,11 @@ pub const Peer = struct {
     protocols: []Protocol,
     name: []const u8,
     running: bool,
+    state: PeerState,
+    last_ping: i64,
+    last_pong: i64,
+    connected_at: i64,
+    disconnect_reason: ?devp2p.DisconnectReason,
 
     pub const Direction = enum {
         inbound,
@@ -336,9 +349,13 @@ pub const Peer = struct {
     };
 
     const Self = @This();
+    const PING_INTERVAL = 15; // Send ping every 15 seconds
+    const PONG_TIMEOUT = 30; // Disconnect if no pong in 30 seconds
+    const HANDSHAKE_TIMEOUT = 10; // Handshake must complete in 10 seconds
 
     pub fn init(allocator: std.mem.Allocator, conn: rlpx.Conn, direction: Direction, protocols: []Protocol) !*Self {
         const self = try allocator.create(Self);
+        const now = std.time.timestamp();
 
         self.* = .{
             .allocator = allocator,
@@ -347,6 +364,11 @@ pub const Peer = struct {
             .protocols = protocols,
             .name = "unknown",
             .running = false,
+            .state = .handshaking,
+            .last_ping = now,
+            .last_pong = now,
+            .connected_at = now,
+            .disconnect_reason = null,
         };
 
         return self;

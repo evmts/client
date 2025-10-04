@@ -265,6 +265,10 @@ pub const UDPv4 = struct {
             .local_node = local_node,
             .routing_table = try KademliaTable.init(allocator, local_node.id),
             .running = false,
+            .bootstrap_state = .idle,
+            .pending_pings = std.AutoHashMap([32]u8, PendingPing).init(allocator),
+            .bootnodes = &[_]Node{},
+            .last_lookup = 0,
         };
 
         return self;
@@ -274,7 +278,127 @@ pub const UDPv4 = struct {
         self.running = false;
         std.posix.close(self.socket);
         self.routing_table.deinit();
+        self.pending_pings.deinit();
         self.allocator.destroy(self);
+    }
+
+    /// Bootstrap discovery with provided bootnodes
+    pub fn bootstrap(self: *Self, bootnodes: []const Node) !void {
+        std.log.info("Starting bootstrap with {} bootnodes", .{bootnodes.len});
+
+        self.bootnodes = try self.allocator.dupe(Node, bootnodes);
+        self.bootstrap_state = .bonding;
+
+        // Bond with all bootnodes
+        for (bootnodes) |node| {
+            try self.bond(&node);
+        }
+
+        // Wait for bonds to complete (simplified - should use async)
+        std.time.sleep(2 * std.time.ns_per_s);
+
+        // Start discovery lookups
+        self.bootstrap_state = .discovering;
+        try self.performLookups();
+
+        self.bootstrap_state = .completed;
+        std.log.info("Bootstrap completed with {} nodes in table", .{self.routing_table.len()});
+    }
+
+    /// Bond with a node (ping-pong exchange)
+    pub fn bond(self: *Self, node: *const Node) !void {
+        const now = std.time.timestamp();
+
+        // Create ping packet
+        const ping_packet = Ping{
+            .version = PROTOCOL_VERSION,
+            .from = .{
+                .ip = self.local_node.ip,
+                .udp_port = self.local_node.udp_port,
+                .tcp_port = self.local_node.tcp_port,
+            },
+            .to = .{
+                .ip = node.ip,
+                .udp_port = node.udp_port,
+                .tcp_port = node.tcp_port,
+            },
+            .expiration = @intCast(now + 60),
+            .enr_seq = null,
+        };
+
+        const payload = try ping_packet.encode(self.allocator);
+        defer self.allocator.free(payload);
+
+        const ping_hash = crypto.keccak256(payload);
+
+        // Track pending ping
+        try self.pending_pings.put(node.id, .{
+            .node_id = node.id,
+            .sent_at = now,
+            .ping_hash = ping_hash,
+        });
+
+        try self.sendPacket(.ping, payload, node.ip);
+        std.log.debug("Sent bond ping to node", .{});
+    }
+
+    /// Perform discovery lookups to fill routing table
+    fn performLookups(self: *Self) !void {
+        const now = std.time.timestamp();
+        self.last_lookup = now;
+
+        // Lookup our own ID to find nearby nodes
+        try self.lookup(self.local_node.id);
+
+        // Lookup random IDs to fill distant buckets
+        var i: usize = 0;
+        while (i < 3) : (i += 1) {
+            var random_id: [32]u8 = undefined;
+            try std.crypto.random.bytes(&random_id);
+            try self.lookup(random_id);
+        }
+    }
+
+    /// Perform recursive lookup for a target ID
+    pub fn lookup(self: *Self, target: [32]u8) !void {
+        std.log.debug("Starting lookup for target", .{});
+
+        // Get closest known nodes
+        const closest = try self.routing_table.findClosest(target, 16);
+        defer self.allocator.free(closest);
+
+        if (closest.len == 0) {
+            // Use bootnodes if table is empty
+            for (self.bootnodes) |bootnode| {
+                try self.findNode(&bootnode, target);
+            }
+            return;
+        }
+
+        // Query closest nodes
+        for (closest) |node| {
+            try self.findNode(&node, target);
+        }
+    }
+
+    /// Refresh buckets that haven't been updated recently
+    pub fn refreshBuckets(self: *Self) !void {
+        const buckets_to_refresh = try self.routing_table.refreshCandidates();
+        defer self.allocator.free(buckets_to_refresh);
+
+        for (buckets_to_refresh) |bucket_idx| {
+            // Generate random ID in this bucket's range
+            var target: [32]u8 = undefined;
+            @memcpy(&target, &self.local_node.id);
+
+            // Flip bit at bucket_idx to target that bucket
+            const byte_idx = bucket_idx / 8;
+            const bit_idx: u3 = @intCast(bucket_idx % 8);
+            target[byte_idx] ^= (@as(u8, 1) << bit_idx);
+
+            try self.lookup(target);
+            self.routing_table.markRefreshed(bucket_idx);
+        }
     }
 
     /// Start discovery protocol
@@ -443,10 +567,39 @@ pub const UDPv4 = struct {
     }
 
     fn handlePong(self: *Self, payload: []const u8, src: std.net.Address) !void {
-        _ = self;
-        _ = payload;
-        _ = src;
-        // TODO: Process pong response
+        var decoder = rlp.Decoder.init(payload);
+        var list_decoder = try decoder.enterList();
+
+        // Decode endpoint
+        _ = try list_decoder.enterList(); // to
+
+        // Decode ping hash
+        const ping_hash_bytes = try list_decoder.decodeBytesView();
+        var ping_hash: [32]u8 = undefined;
+        @memcpy(&ping_hash, ping_hash_bytes[0..32]);
+
+        // Verify this matches a pending ping
+        var iter = self.pending_pings.iterator();
+        while (iter.next()) |entry| {
+            const pending = entry.value_ptr.*;
+            if (std.mem.eql(u8, &pending.ping_hash, &ping_hash)) {
+                // Bond verified - add node to routing table
+                const node = Node{
+                    .id = pending.node_id,
+                    .ip = src,
+                    .udp_port = src.getPort(),
+                    .tcp_port = src.getPort(),
+                };
+
+                try self.routing_table.addNode(node);
+                _ = self.pending_pings.remove(pending.node_id);
+
+                std.log.debug("Bond verified, node added to routing table", .{});
+                return;
+            }
+        }
+
+        std.log.warn("Received pong with unknown ping hash", .{});
     }
 
     fn handleFindNode(self: *Self, payload: []const u8, src: std.net.Address) !void {
@@ -478,10 +631,50 @@ pub const UDPv4 = struct {
     }
 
     fn handleNeighbors(self: *Self, payload: []const u8, src: std.net.Address) !void {
-        _ = self;
-        _ = payload;
         _ = src;
-        // TODO: Add received nodes to routing table
+
+        var decoder = rlp.Decoder.init(payload);
+        var list_decoder = try decoder.enterList();
+
+        // Decode nodes list
+        var nodes_list = try list_decoder.enterList();
+
+        while (!nodes_list.isEmpty()) {
+            var node_list = try nodes_list.enterList();
+
+            // Decode IP
+            const ip_bytes = try node_list.decodeBytesView();
+            const ip_addr = if (ip_bytes.len == 4) blk: {
+                var addr_bytes: [4]u8 = undefined;
+                @memcpy(&addr_bytes, ip_bytes[0..4]);
+                break :blk try std.net.Address.initIp4(addr_bytes, 0);
+            } else blk: {
+                var addr_bytes: [16]u8 = undefined;
+                @memcpy(&addr_bytes, ip_bytes[0..16]);
+                break :blk try std.net.Address.initIp6(addr_bytes, 0, 0, 0);
+            };
+
+            const udp_port: u16 = @intCast(try node_list.decodeInt());
+            const tcp_port: u16 = @intCast(try node_list.decodeInt());
+
+            const node_id_bytes = try node_list.decodeBytesView();
+            var node_id: [32]u8 = undefined;
+            @memcpy(&node_id, node_id_bytes[0..32]);
+
+            // Create and add node
+            var node_addr = ip_addr;
+            node_addr.setPort(udp_port);
+
+            const node = Node{
+                .id = node_id,
+                .ip = node_addr,
+                .udp_port = udp_port,
+                .tcp_port = tcp_port,
+            };
+
+            try self.routing_table.addNode(node);
+            std.log.debug("Added neighbor node to routing table", .{});
+        }
     }
 };
 

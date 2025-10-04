@@ -179,7 +179,7 @@ pub const Transaction = union(TxType) {
             .legacy => |tx| tx.common.getSender(),
             .access_list => |tx| tx.legacy.common.getSender(),
             .dynamic_fee => |tx| tx.common.getSender(),
-            // .blob => |tx| tx.common.getSender(),
+            .blob => |tx| tx.dynamic_fee.common.getSender(),
             // .set_code => |tx| tx.common.getSender(),
             // .account_abstraction => null,
         };
@@ -191,7 +191,7 @@ pub const Transaction = union(TxType) {
             .legacy => |*tx| tx.common.setSender(sender),
             .access_list => |*tx| tx.legacy.common.setSender(sender),
             .dynamic_fee => |*tx| tx.common.setSender(sender),
-            // .blob => |*tx| tx.common.setSender(sender),
+            .blob => |*tx| tx.dynamic_fee.common.setSender(sender),
             // .set_code => |*tx| tx.common.setSender(sender),
             // .account_abstraction => {},
         }
@@ -203,6 +203,7 @@ pub const Transaction = union(TxType) {
             .legacy => |*tx| try tx.hash(allocator),
             .access_list => |*tx| try tx.hash(allocator),
             .dynamic_fee => |*tx| try tx.hash(allocator),
+            .blob => |*tx| try tx.hash(allocator),
         };
     }
 

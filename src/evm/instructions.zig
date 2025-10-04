@@ -372,9 +372,10 @@ test "arithmetic instructions" {
     try opSub(&stack);
     try testing.expectEqual(@as(u256, 70), try stack.pop());
 
-    // Test DIV
-    try stack.push(100);
-    try stack.push(3);
+    // Test DIV: stack [100, 3], pops 3 then 100, computes 3 / 100 = 0
+    // We want 100 / 3 = 33, so push 3 first, then 100
+    try stack.push(3);   // First
+    try stack.push(100); // Top
     try opDiv(&stack);
     try testing.expectEqual(@as(u256, 33), try stack.pop());
 
@@ -398,9 +399,9 @@ test "comparison instructions" {
     try opLt(&stack);
     try testing.expectEqual(@as(u256, 1), try stack.pop());
 
-    // Test GT
-    try stack.push(10);
-    try stack.push(5);
+    // Test GT: want 10 > 5, so push 5 first, then 10
+    try stack.push(5);  // First
+    try stack.push(10); // Top, pops to get 10, 5, checks 10 > 5
     try opGt(&stack);
     try testing.expectEqual(@as(u256, 1), try stack.pop());
 

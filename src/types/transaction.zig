@@ -19,8 +19,7 @@ const LegacyTx = @import("legacy.zig").LegacyTx;
 const AccessListTx = @import("access_list.zig").AccessListTx;
 const DynamicFeeTx = @import("dynamic_fee.zig").DynamicFeeTx;
 const BlobTx = @import("blob.zig").BlobTx;
-// TODO: Import other transaction types as they're implemented
-// const SetCodeTx = @import("set_code.zig").SetCodeTx;
+const SetCodeTx = @import("set_code.zig").SetCodeTx;
 
 /// Main transaction type (tagged union)
 pub const Transaction = union(TxType) {
@@ -28,8 +27,8 @@ pub const Transaction = union(TxType) {
     access_list: AccessListTx,
     dynamic_fee: DynamicFeeTx,
     blob: BlobTx,
+    set_code: SetCodeTx,
     // TODO: Add other transaction types
-    // set_code: SetCodeTx,
     // account_abstraction: AATx,
 
     /// Get transaction type byte
@@ -39,7 +38,7 @@ pub const Transaction = union(TxType) {
             .access_list => 1,
             .dynamic_fee => 2,
             .blob => 3,
-            // .set_code => 4,
+            .set_code => 4,
             // .account_abstraction => 5,
         };
     }
@@ -65,6 +64,7 @@ pub const Transaction = union(TxType) {
             .access_list => |tx| tx.getGasPrice(),
             .dynamic_fee => |tx| tx.getGasPrice(),
             .blob => |tx| tx.getGasPrice(),
+            .set_code => |tx| tx.getGasPrice(),
         };
     }
 
@@ -150,7 +150,7 @@ pub const Transaction = union(TxType) {
         return switch (self) {
             .legacy => |tx| tx.isProtected(),
             // All typed transactions are protected by default
-            .access_list, .dynamic_fee, .blob => true,
+            .access_list, .dynamic_fee, .blob, .set_code => true,
         };
     }
 
@@ -161,7 +161,7 @@ pub const Transaction = union(TxType) {
             .access_list => |tx| tx.chain_id,
             .dynamic_fee => |tx| tx.chain_id,
             .blob => |tx| tx.dynamic_fee.chain_id,
-            // .set_code => |tx| tx.chain_id,
+            .set_code => |tx| tx.dynamic_fee.chain_id,
             // .account_abstraction => null,
         };
     }
@@ -180,7 +180,7 @@ pub const Transaction = union(TxType) {
             .access_list => |tx| tx.legacy.common.getSender(),
             .dynamic_fee => |tx| tx.common.getSender(),
             .blob => |tx| tx.dynamic_fee.common.getSender(),
-            // .set_code => |tx| tx.common.getSender(),
+            .set_code => |tx| tx.dynamic_fee.common.getSender(),
             // .account_abstraction => null,
         };
     }
@@ -192,7 +192,7 @@ pub const Transaction = union(TxType) {
             .access_list => |*tx| tx.legacy.common.setSender(sender),
             .dynamic_fee => |*tx| tx.common.setSender(sender),
             .blob => |*tx| tx.dynamic_fee.common.setSender(sender),
-            // .set_code => |*tx| tx.common.setSender(sender),
+            .set_code => |*tx| tx.dynamic_fee.common.setSender(sender),
             // .account_abstraction => {},
         }
     }
@@ -204,6 +204,7 @@ pub const Transaction = union(TxType) {
             .access_list => |*tx| try tx.hash(allocator),
             .dynamic_fee => |*tx| try tx.hash(allocator),
             .blob => |*tx| try tx.hash(allocator),
+            .set_code => |*tx| try tx.hash(allocator),
         };
     }
 
@@ -223,6 +224,10 @@ pub const Transaction = union(TxType) {
                 _ = chain_id; // blob has its own chain_id
                 return try tx.signingHash(allocator);
             },
+            .set_code => |tx| {
+                _ = chain_id; // set_code has its own chain_id
+                return try tx.signingHash(allocator);
+            },
         };
     }
 
@@ -233,6 +238,7 @@ pub const Transaction = union(TxType) {
             .access_list => |tx| .{ .access_list = try tx.clone(allocator) },
             .dynamic_fee => |tx| .{ .dynamic_fee = try tx.clone(allocator) },
             .blob => |tx| .{ .blob = try tx.clone(allocator) },
+            .set_code => |tx| .{ .set_code = try tx.clone(allocator) },
         };
     }
 
@@ -243,6 +249,7 @@ pub const Transaction = union(TxType) {
             .access_list => |*tx| tx.deinit(allocator),
             .dynamic_fee => |*tx| tx.deinit(allocator),
             .blob => |*tx| tx.deinit(allocator),
+            .set_code => |*tx| tx.deinit(allocator),
         }
     }
 
@@ -274,6 +281,7 @@ pub const Transaction = union(TxType) {
             .access_list => |tx| try tx.encode(allocator),
             .dynamic_fee => |tx| try tx.encode(allocator),
             .blob => |tx| try tx.encode(allocator),
+            .set_code => |tx| try tx.encode(allocator),
         };
     }
 };

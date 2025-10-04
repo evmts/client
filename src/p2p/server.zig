@@ -519,7 +519,7 @@ pub const Server = struct {
                 // Check if we're shutting down
                 if (!self.running.load(.acquire)) break;
                 std.log.err("Accept error: {}", .{err});
-                std.time.sleep(200 * std.time.ns_per_ms);
+                std.Thread.sleep(200 * std.time.ns_per_ms);
                 continue;
             };
 
@@ -571,7 +571,7 @@ pub const Server = struct {
 
                 // Attempt TCP connection
                 const stream = std.net.tcpConnectToAddress(dest.ip) catch |err| {
-                    std.log.debug("Failed to dial {}: {}", .{dest.ip, err});
+                    std.log.debug("Failed to dial {any}: {}", .{dest.ip, err});
                     return err;
                 };
 

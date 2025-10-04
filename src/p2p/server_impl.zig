@@ -29,11 +29,12 @@ pub fn run(self: *Server) !void {
 
     while (!self.quit.load(.acquire)) {
         // Process queues (non-blocking)
-        try self.processAddTrusted();
-        try self.processRemoveTrusted();
-        try self.processCheckpointPostHandshake();
-        try self.processCheckpointAddPeer(&inbound_count);
-        try self.processDelPeer(&inbound_count);
+        const impl = @import("server_impl.zig");
+        try impl.processAddTrusted(self);
+        try impl.processRemoveTrusted(self);
+        try impl.processCheckpointPostHandshake(self);
+        try impl.processCheckpointAddPeer(self, &inbound_count);
+        try impl.processDelPeer(self, &inbound_count);
 
         // Log stats periodically
         const now = std.time.milliTimestamp();
@@ -66,7 +67,7 @@ pub fn run(self: *Server) !void {
 }
 
 /// Process add trusted queue
-fn processAddTrusted(self: *Server) !void {
+pub fn processAddTrusted(self: *Server) !void {
     self.add_trusted_mutex.lock();
     defer self.add_trusted_mutex.unlock();
 
@@ -148,11 +149,12 @@ fn processCheckpointAddPeer(self: *Server, inbound_count: *u32) !void {
         var msg = &self.checkpoint_add_peer_queue.items[0];
 
         // Perform post-handshake checks
-        const check_err = self.postHandshakeChecks(msg.conn, inbound_count.*);
+        const impl = @import("server_impl.zig");
+        const check_err = impl.postHandshakeChecks(self, msg.conn, inbound_count.*);
 
         if (check_err == null) {
             // Success - add the peer
-            const peer = try self.launchPeer(msg.conn);
+            const peer = try impl.launchPeer(self, msg.conn);
 
             self.peers_mutex.lock();
             try self.peers.put(msg.conn.node.?.id, peer);
@@ -237,7 +239,7 @@ fn processDelPeer(self: *Server, inbound_count: *u32) !void {
 }
 
 /// Post-handshake checks (matches Erigon's postHandshakeChecks)
-fn postHandshakeChecks(self: *Server, conn: *Conn, inbound_count: u32) ?anyerror {
+pub fn postHandshakeChecks(self: *Server, conn: *Conn, inbound_count: u32) ?anyerror {
     const is_trusted = conn.isSet(.trusted);
     const is_inbound = conn.isSet(.inbound);
 
@@ -253,7 +255,8 @@ fn postHandshakeChecks(self: *Server, conn: *Conn, inbound_count: u32) ?anyerror
 
     // Check: too many inbound peers (unless trusted)
     if (!is_trusted and is_inbound) {
-        const max_inbound = self.maxInboundConns();
+        const impl = @import("server_impl.zig");
+    const max_inbound = impl.maxInboundConns(self);
         if (inbound_count >= max_inbound) {
             return error.TooManyPeers;
         }
@@ -295,7 +298,7 @@ fn countMatchingProtocols(server_protos: []const Protocol, conn_caps: []Cap) u32
 }
 
 /// Launch peer and start its goroutine
-fn launchPeer(self: *Server, conn: *Conn) !*Peer {
+pub fn launchPeer(self: *Server, conn: *Conn) !*Peer {
     const peer = try Peer.init(self.allocator, conn, self.config.protocols);
 
     // Spawn peer run loop in separate thread
@@ -322,26 +325,24 @@ pub fn setupConn(self: *Server, fd: std.net.Stream, flags: u32, dial_dest: ?disc
     errdefer conn.deinit();
 
     // Initialize transport
-    const stream = net.Stream{ .handle = fd };
-    if (dial_dest) |dest| {
-        conn.transport = rlpx.Conn.init(self.allocator, stream, dest.id);
-    } else {
-        conn.transport = rlpx.Conn.init(self.allocator, stream, null);
-    }
+    // Note: Node.id is 32 bytes (hash), but RLPx needs 64-byte public key
+    // For now, use null until we have actual public key storage
+    conn.transport = rlpx.Conn.init(self.allocator, fd, null);
 
     // Run the handshake sequence
-    try self.setupConnHandshakes(conn, dial_dest);
+    const impl = @import("server_impl.zig");
+    try impl.setupConnHandshakes(self, conn, dial_dest);
 }
 
 /// Setup connection handshakes
-fn setupConnHandshakes(self: *Server, conn: *Conn, dial_dest: ?discovery.Node) !void {
+pub fn setupConnHandshakes(self: *Server, conn: *Conn, dial_dest: ?discovery.Node) !void {
     // Check if server is still running
     if (!self.running.load(.acquire)) {
         return error.ServerStopped;
     }
 
     // Perform RLPx encryption handshake
-    const remote_pubkey = try conn.transport.doEncHandshake(&self.config.priv_key);
+    const remote_pubkey = try conn.transport.handshake(self.config.priv_key);
     _ = remote_pubkey;
 
     // Set node from dial destination or derive from pubkey
@@ -424,7 +425,7 @@ fn buildHandshake(self: *Server) !devp2p.ProtoHandshake {
 
 /// Check inbound connection (throttling)
 pub fn checkInboundConn(self: *Server, fd: std.net.Stream) !void {
-    const remote_addr = fd.getRemoteAddress() catch return error.NoRemoteAddress;
+    const remote_addr = fd.getLocalAddress() catch return error.NoRemoteAddress;
 
     // Get IP string
     var ip_buf: [64]u8 = undefined;
@@ -459,7 +460,7 @@ pub fn checkInboundConn(self: *Server, fd: std.net.Stream) !void {
 }
 
 /// Calculate max inbound connections
-fn maxInboundConns(self: *Server) u32 {
+pub fn maxInboundConns(self: *Server) u32 {
     const max_dialed = self.maxDialedConns();
     return self.config.max_peers - max_dialed;
 }

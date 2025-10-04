@@ -686,9 +686,13 @@ pub const UDPv4 = struct {
         }
 
         // Verify signature and recover sender ID (public key hash)
-        const sender_address = try Crypto.unaudited_recoverAddress(computed_hash, signature);
+        // Parse signature from bytes
+        const sig_struct = Crypto.Signature.from_bytes(signature[0..65].*);
+        const sender_address = try Crypto.unaudited_recoverAddress(computed_hash, sig_struct);
+        // Use first 32 bytes of address hash as sender ID
         var sender_id: [32]u8 = undefined;
-        @memcpy(&sender_id, &sender_address.data);
+        @memcpy(sender_id[0..20], &sender_address.bytes);
+        @memset(sender_id[20..], 0); // Pad with zeros
 
         // Dispatch based on packet type
         switch (packet_type) {
@@ -1222,8 +1226,8 @@ pub const KademliaTable = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        var candidates = std.ArrayList(Node).init(self.allocator);
-        defer candidates.deinit();
+        var candidates = std.ArrayList(Node){};
+        defer candidates.deinit(self.allocator);
 
         // Collect all verified nodes (liveness_checks > 0)
         for (self.buckets) |bucket| {
@@ -1266,8 +1270,8 @@ pub const KademliaTable = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        var all_nodes = std.ArrayList(Node).init(self.allocator);
-        defer all_nodes.deinit();
+        var all_nodes = std.ArrayList(Node){};
+        defer all_nodes.deinit(self.allocator);
 
         // Collect all verified nodes
         for (self.buckets) |bucket| {

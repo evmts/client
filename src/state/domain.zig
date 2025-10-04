@@ -41,7 +41,7 @@ pub const Domain = struct {
 
     /// Files currently open (equivalent to dirtyFiles btree)
     /// In Erigon this is btree2.BTreeG[*FilesItem]
-    files: std.ArrayList(DomainFile),
+    files: std.ArrayList(DomainFile) = .{},
 
     /// Current step (txNum / stepSize)
     current_step: u64,
@@ -60,7 +60,7 @@ pub const Domain = struct {
             .allocator = allocator,
             .config = config,
             .history = history,
-            .files = std.ArrayList(DomainFile).init(allocator),
+            .files = .{},
             .current_step = 0,
         };
     }
@@ -73,7 +73,7 @@ pub const Domain = struct {
         for (self.files.items) |*file| {
             file.deinit();
         }
-        self.files.deinit();
+        self.files.deinit(self.allocator);
     }
 
     /// Get value for key at specific transaction number (temporal query)

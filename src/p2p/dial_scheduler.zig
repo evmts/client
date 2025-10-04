@@ -668,7 +668,7 @@ pub const DialScheduler = struct {
                 };
             } else {
                 // Wait a bit before trying again
-                std.time.sleep(1 * std.time.ns_per_s);
+                std.Thread.sleep(1 * std.time.ns_per_s);
             }
         }
     }

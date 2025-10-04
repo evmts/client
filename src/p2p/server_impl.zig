@@ -43,7 +43,7 @@ pub fn run(self: *Server) !void {
         }
 
         // Sleep briefly to avoid busy-waiting
-        std.time.sleep(10 * std.time.ns_per_ms);
+        std.Thread.sleep(10 * std.time.ns_per_ms);
     }
 
     // Shutdown: disconnect all peers
@@ -61,7 +61,7 @@ pub fn run(self: *Server) !void {
         const count = self.peers.count();
         self.peers_mutex.unlock();
         if (count == 0) break;
-        std.time.sleep(100 * std.time.ns_per_ms);
+        std.Thread.sleep(100 * std.time.ns_per_ms);
     }
 }
 

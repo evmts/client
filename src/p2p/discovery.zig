@@ -398,7 +398,7 @@ pub const UDPv4 = struct {
         // Wait for pong response (simplified - should use async)
         var retries: usize = 0;
         while (retries < 10) : (retries += 1) {
-            std.time.sleep(100 * std.time.ns_per_ms);
+            std.Thread.sleep(100 * std.time.ns_per_ms);
             if (self.checkBond(node.id)) {
                 return;
             }
@@ -420,7 +420,7 @@ pub const UDPv4 = struct {
         }
 
         // Wait for bonds to complete (simplified - should use async)
-        std.time.sleep(2 * std.time.ns_per_s);
+        std.Thread.sleep(2 * std.time.ns_per_s);
 
         // Start discovery lookups
         self.bootstrap_state = .discovering;
@@ -763,7 +763,7 @@ pub const UDPv4 = struct {
             try self.ping(&node);
 
             // Wait for response (simplified)
-            std.time.sleep(RESP_TIMEOUT * std.time.ns_per_ms);
+            std.Thread.sleep(RESP_TIMEOUT * std.time.ns_per_ms);
 
             // Check if we got pong
             if (!self.checkBond(node.id)) {

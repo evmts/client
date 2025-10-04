@@ -18,8 +18,8 @@ pub const CommonTx = common_mod.CommonTx;
 const LegacyTx = @import("legacy.zig").LegacyTx;
 const AccessListTx = @import("access_list.zig").AccessListTx;
 const DynamicFeeTx = @import("dynamic_fee.zig").DynamicFeeTx;
+const BlobTx = @import("blob.zig").BlobTx;
 // TODO: Import other transaction types as they're implemented
-// const BlobTx = @import("blob.zig").BlobTx;
 // const SetCodeTx = @import("set_code.zig").SetCodeTx;
 
 /// Main transaction type (tagged union)
@@ -27,8 +27,8 @@ pub const Transaction = union(TxType) {
     legacy: LegacyTx,
     access_list: AccessListTx,
     dynamic_fee: DynamicFeeTx,
+    blob: BlobTx,
     // TODO: Add other transaction types
-    // blob: BlobTx,
     // set_code: SetCodeTx,
     // account_abstraction: AATx,
 
@@ -38,7 +38,7 @@ pub const Transaction = union(TxType) {
             .legacy => 0,
             .access_list => 1,
             .dynamic_fee => 2,
-            // .blob => 3,
+            .blob => 3,
             // .set_code => 4,
             // .account_abstraction => 5,
         };
@@ -64,6 +64,7 @@ pub const Transaction = union(TxType) {
             .legacy => |tx| tx.getGasPrice(),
             .access_list => |tx| tx.getGasPrice(),
             .dynamic_fee => |tx| tx.getGasPrice(),
+            .blob => |tx| tx.getGasPrice(),
         };
     }
 
@@ -149,7 +150,7 @@ pub const Transaction = union(TxType) {
         return switch (self) {
             .legacy => |tx| tx.isProtected(),
             // All typed transactions are protected by default
-            .access_list, .dynamic_fee => true,
+            .access_list, .dynamic_fee, .blob => true,
         };
     }
 

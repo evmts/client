@@ -542,11 +542,11 @@ pub fn getPrecompile(address: Address) ?*const Precompile {
         0x02 => &SHA256,
         0x03 => &RIPEMD160,
         0x04 => &IDENTITY,
-        // 0x05 => MODEXP (TODO)
+        0x05 => &MODEXP,
         // 0x06 => BN254_ADD (TODO)
         // 0x07 => BN254_MUL (TODO)
         // 0x08 => BN254_PAIRING (TODO)
-        // 0x09 => BLAKE2F (TODO)
+        0x09 => &BLAKE2F,
         // 0x0a => POINT_EVALUATION (TODO)
         else => null,
     };

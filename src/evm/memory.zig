@@ -13,16 +13,19 @@ pub const Memory = struct {
     last_gas_cost: u64,
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator) !Memory {
+    pub fn init(allocator: std.mem.Allocator) Memory {
         return Memory{
-            .store = std.ArrayList(u8).init(allocator),
+            .store = .{
+                .items = &.{},
+                .capacity = 0,
+            },
             .last_gas_cost = 0,
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *Memory) void {
-        self.store.deinit();
+        self.store.deinit(self.allocator);
     }
 
     pub fn reset(self: *Memory) void {
@@ -50,7 +53,7 @@ pub const Memory = struct {
         const grow_by = @as(usize, @intCast(size)) - current_len;
 
         // Append zeros
-        try self.store.appendNTimes(0, grow_by);
+        try self.store.appendNTimes(self.allocator, 0, grow_by);
     }
 
     /// Set memory[offset:offset+size] = value
@@ -62,7 +65,9 @@ pub const Memory = struct {
             return error.MemoryAccessOutOfBounds;
         }
 
-        @memcpy(self.store.items[@intCast(offset)..][0..@intCast(size)], value[0..@min(value.len, @intCast(size))]);
+        const size_usize: usize = @intCast(size);
+        const offset_usize: usize = @intCast(offset);
+        @memcpy(self.store.items[offset_usize..][0..size_usize], value[0..@min(value.len, size_usize)]);
     }
 
     /// Set 32 bytes at offset to value (big-endian u256)
@@ -86,9 +91,11 @@ pub const Memory = struct {
             return error.MemoryAccessOutOfBounds;
         }
 
-        const copy = try allocator.alloc(u8, @intCast(size));
-        @memcpy(copy, self.store.items[@intCast(offset)..][0..@intCast(size)]);
-        return copy;
+        const size_usize: usize = @intCast(size);
+        const offset_usize: usize = @intCast(offset);
+        const result = try allocator.alloc(u8, size_usize);
+        @memcpy(result, self.store.items[offset_usize..][0..size_usize]);
+        return result;
     }
 
     /// Get pointer to memory[offset:offset+size] (no copy)
@@ -117,7 +124,7 @@ pub const Memory = struct {
 
     /// Copy memory[src:src+length] to memory[dst:dst+length]
     /// Source and destination may overlap
-    pub fn copy(self: *Memory, dst: u64, src: u64, length: u64) !void {
+    pub fn copyMem(self: *Memory, dst: u64, src: u64, length: u64) !void {
         if (length == 0) return;
 
         const src_end = src + length;
@@ -127,9 +134,13 @@ pub const Memory = struct {
             return error.MemoryAccessOutOfBounds;
         }
 
+        const length_usize: usize = @intCast(length);
+        const src_usize: usize = @intCast(src);
+        const dst_usize: usize = @intCast(dst);
+
         // Use memmove semantics (handles overlap)
-        const src_slice = self.store.items[@intCast(src)..][0..@intCast(length)];
-        const dst_slice = self.store.items[@intCast(dst)..][0..@intCast(length)];
+        const src_slice = self.store.items[src_usize..][0..length_usize];
+        const dst_slice = self.store.items[dst_usize..][0..length_usize];
 
         // std.mem.copyForwards handles overlapping regions
         if (dst <= src) {
@@ -173,7 +184,7 @@ test "memory basic operations" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    var mem = try Memory.init(allocator);
+    var mem = Memory.init(allocator);
     defer mem.deinit();
 
     // Test resize
@@ -192,7 +203,7 @@ test "memory set32 and get32" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    var mem = try Memory.init(allocator);
+    var mem = Memory.init(allocator);
     defer mem.deinit();
 
     try mem.resize(64);
@@ -208,7 +219,7 @@ test "memory copy" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    var mem = try Memory.init(allocator);
+    var mem = Memory.init(allocator);
     defer mem.deinit();
 
     try mem.resize(64);
@@ -218,7 +229,7 @@ test "memory copy" {
     try mem.set(0, 5, &test_data);
 
     // Copy it
-    try mem.copy(10, 0, 5);
+    try mem.copyMem(10, 0, 5);
 
     // Verify
     const original = try mem.getPtr(0, 5);
@@ -252,7 +263,7 @@ test "memory overlapping copy" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    var mem = try Memory.init(allocator);
+    var mem = Memory.init(allocator);
     defer mem.deinit();
 
     try mem.resize(64);
@@ -263,7 +274,7 @@ test "memory overlapping copy" {
     }
 
     // Overlapping copy (forward)
-    try mem.copy(5, 0, 5); // Copy [0..5] to [5..10]
+    try mem.copyMem(5, 0, 5); // Copy [0..5] to [5..10]
 
     const result = try mem.getPtr(5, 5);
     try testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 2, 3, 4 }, result);

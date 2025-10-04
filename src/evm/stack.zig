@@ -13,14 +13,19 @@ pub const Stack = struct {
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) !Stack {
+        var data: std.ArrayList(u256) = .{
+            .items = &.{},
+            .capacity = 0,
+        };
+        try data.ensureTotalCapacity(allocator, 16);
         return Stack{
-            .data = try std.ArrayList(u256).initCapacity(allocator, 16),
+            .data = data,
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *Stack) void {
-        self.data.deinit();
+        self.data.deinit(self.allocator);
     }
 
     pub fn reset(self: *Stack) void {
@@ -35,14 +40,14 @@ pub const Stack = struct {
         if (self.data.items.len >= MAX_STACK_SIZE) {
             return error.StackOverflow;
         }
-        try self.data.append(value);
+        try self.data.append(self.allocator, value);
     }
 
     pub fn pop(self: *Stack) !u256 {
         if (self.data.items.len == 0) {
             return error.StackUnderflow;
         }
-        return self.data.pop();
+        return self.data.pop() orelse return error.StackUnderflow;
     }
 
     /// Peek at top of stack without removing
@@ -74,7 +79,7 @@ pub const Stack = struct {
         }
 
         const value = self.data.items[self.data.items.len - n];
-        try self.data.append(value);
+        try self.data.append(self.allocator, value);
     }
 
     /// Swap top with n-th item (1-indexed: swap1 swaps top two)
@@ -196,11 +201,11 @@ test "stack dup and swap" {
     try testing.expectEqual(@as(u256, 30), top);
 
     // Test swap
-    try stack.swap1(); // Swap top two: [10, 30, 20]
+    try stack.swap1(); // Swap top two: [10, 20, 30] (was [10, 30, 20])
     const val1 = try stack.pop();
-    try testing.expectEqual(@as(u256, 30), val1);
+    try testing.expectEqual(@as(u256, 20), val1);
     const val2 = try stack.pop();
-    try testing.expectEqual(@as(u256, 20), val2);
+    try testing.expectEqual(@as(u256, 30), val2);
 }
 
 test "stack overflow and underflow" {

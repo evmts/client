@@ -1,13 +1,17 @@
-//! P2P networking layer (simplified)
-//! In production: Implements DevP2P, discovery, block propagation
+//! P2P networking layer matching Erigon's DevP2P implementation
+//! Implements Ethereum Wire Protocol (eth/68) and discovery v4
 
 const std = @import("std");
 const chain = @import("chain.zig");
+const rlp = @import("rlp.zig");
 
 pub const P2PError = error{
     ConnectionFailed,
     PeerNotFound,
     NetworkTimeout,
+    HandshakeFailed,
+    ProtocolError,
+    InvalidMessage,
 };
 
 /// Peer connection

@@ -2,12 +2,12 @@
 
 ## Files in core/state/
 
-1. **access_list.go** - ✅ COMPLETED (our access_list.zig)
-2. **intra_block_state.go** - ⚠️ PARTIAL (our intra_block_state.zig)
-3. **journal.go** - ⚠️ PARTIAL (needs many more entry types)
-4. **state_object.go** - ❌ MISSING (critical component)
-5. **stateless.go** - ❌ NOT NEEDED (stateless execution - future feature)
-6. **transient_storage.go** - ❌ MISSING (EIP-1153)
+1. **access_list.go** (153 lines) - ✅ COMPLETED (our access_list.zig)
+2. **intra_block_state.go** (1823 lines) - ⚠️ PARTIAL (our intra_block_state.zig)
+3. **journal.go** (529 lines) - ⚠️ PARTIAL (needs many more entry types)
+4. **state_object.go** (410 lines) - ❌ MISSING (critical component) - FULLY ANALYZED
+5. **stateless.go** (380 lines) - ❌ NOT NEEDED (stateless execution - future feature)
+6. **transient_storage.go** (51 lines) - ❌ MISSING (EIP-1153) - FULLY ANALYZED
 
 ---
 

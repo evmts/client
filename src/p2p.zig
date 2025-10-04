@@ -1,9 +1,28 @@
-//! P2P networking layer matching Erigon's DevP2P implementation
-//! Implements Ethereum Wire Protocol (eth/68) and discovery v4
+//! P2P networking layer - Full implementation with RLPx and Discovery
+//!
+//! This module provides the complete P2P networking stack:
+//! - RLPx protocol for encrypted transport
+//! - Discovery v4 for node finding (Kademlia DHT)
+//! - DevP2P for Ethereum protocol messaging
+//! - Peer connection management
+//!
+//! Matches Erigon's architecture from p2p/rlpx, p2p/discover, p2p/server
 
 const std = @import("std");
-const chain = @import("chain.zig");
-const rlp = @import("rlp.zig");
+
+// Re-export submodules
+pub const rlpx = @import("p2p/rlpx.zig");
+pub const discovery = @import("p2p/discovery.zig");
+pub const devp2p = @import("p2p/devp2p.zig");
+pub const server = @import("p2p/server.zig");
+
+// Re-export key types for convenience
+pub const Server = server.Server;
+pub const Protocol = server.Protocol;
+pub const Peer = server.Peer;
+pub const Node = discovery.Node;
+pub const UDPv4 = discovery.UDPv4;
+pub const Conn = rlpx.Conn;
 
 pub const P2PError = error{
     ConnectionFailed,
@@ -12,113 +31,43 @@ pub const P2PError = error{
     HandshakeFailed,
     ProtocolError,
     InvalidMessage,
+    NoSession,
+    InvalidMAC,
+    TooManyPeers,
 };
 
-/// Peer connection
-pub const Peer = struct {
-    id: [32]u8,
-    address: std.net.Address,
-    protocol_version: u32,
-    connected: bool,
-
-    pub fn disconnect(self: *Peer) void {
-        self.connected = false;
-    }
-};
-
-/// P2P network manager
+/// Simplified network manager (legacy compatibility)
 pub const NetworkManager = struct {
-    allocator: std.mem.Allocator,
-    peers: std.ArrayList(Peer),
-    max_peers: u32,
-    listening: bool,
+    server: *Server,
 
-    pub fn init(allocator: std.mem.Allocator, max_peers: u32) NetworkManager {
-        return .{
-            .allocator = allocator,
-            .peers = std.ArrayList(Peer).empty,
+    pub fn init(allocator: std.mem.Allocator, max_peers: u32, listen_port: u16, priv_key: [32]u8) !NetworkManager {
+        const config = server.Config{
             .max_peers = max_peers,
-            .listening = false,
+            .listen_addr = try std.net.Address.parseIp4("0.0.0.0", listen_port),
+            .discovery_port = listen_port,
+            .priv_key = priv_key,
+            .bootnodes = &[_]Node{},
+            .protocols = &[_]Protocol{},
         };
+
+        const srv = try Server.init(allocator, config);
+        return .{ .server = srv };
     }
 
     pub fn deinit(self: *NetworkManager) void {
-        self.peers.deinit(self.allocator);
+        self.server.deinit();
     }
 
     /// Start listening for peer connections
-    pub fn start(self: *NetworkManager, port: u16) !void {
-        _ = port;
-        self.listening = true;
-        std.log.info("P2P network started (simplified mode)", .{});
+    pub fn start(self: *NetworkManager) !void {
+        try self.server.start();
     }
 
-    /// Stop the network
     pub fn stop(self: *NetworkManager) void {
-        self.listening = false;
-        for (self.peers.items) |*peer| {
-            peer.disconnect();
-        }
+        self.server.stop();
     }
 
-    /// Connect to a peer
-    pub fn connectPeer(self: *NetworkManager, address: std.net.Address) !void {
-        if (self.peers.items.len >= self.max_peers) {
-            return P2PError.PeerNotFound;
-        }
-
-        const peer = Peer{
-            .id = [_]u8{0} ** 32,
-            .address = address,
-            .protocol_version = 68, // eth/68
-            .connected = true,
-        };
-
-        try self.peers.append(self.allocator, peer);
-        std.log.info("Connected to peer (count: {})", .{self.peers.items.len});
-    }
-
-    /// Broadcast block to peers
-    pub fn broadcastBlock(self: *NetworkManager, block: *const chain.Block) !void {
-        if (self.peers.items.len == 0) {
-            return; // No peers to broadcast to
-        }
-        std.log.debug("Broadcasting block {} to {} peers", .{ block.number(), self.peers.items.len });
-    }
-
-    /// Request headers from peers
-    pub fn requestHeaders(self: *NetworkManager, from: u64, to: u64) ![]chain.Header {
-        _ = self;
-        _ = from;
-        _ = to;
-        // In production: Send GetBlockHeaders message to peers
-        // For minimal implementation: return empty
-        return &[_]chain.Header{};
-    }
-
-    /// Get peer count
-    pub fn getPeerCount(self: *NetworkManager) u32 {
-        return @as(u32, @intCast(self.peers.items.len));
+    pub fn peerCount(self: *NetworkManager) u32 {
+        return self.server.peerCount();
     }
 };
-
-test "network manager initialization" {
-    var network = NetworkManager.init(std.testing.allocator, 50);
-    defer network.deinit();
-
-    try network.start(30303);
-    try std.testing.expect(network.listening);
-
-    network.stop();
-    try std.testing.expect(!network.listening);
-}
-
-test "peer connection" {
-    var network = NetworkManager.init(std.testing.allocator, 10);
-    defer network.deinit();
-
-    const addr = try std.net.Address.parseIp("127.0.0.1", 30303);
-    try network.connectPeer(addr);
-
-    try std.testing.expectEqual(@as(u32, 1), network.getPeerCount());
-}

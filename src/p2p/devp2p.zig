@@ -20,6 +20,137 @@ pub const ProtocolVersion = enum(u8) {
     }
 };
 
+/// Base devp2p message types (before protocol-specific)
+pub const BaseMessageType = enum(u8) {
+    hello = 0x00,
+    disconnect = 0x01,
+    ping = 0x02,
+    pong = 0x03,
+};
+
+/// Disconnect reasons
+pub const DisconnectReason = enum(u8) {
+    requested = 0x00,
+    tcp_error = 0x01,
+    breach_of_protocol = 0x02,
+    useless_peer = 0x03,
+    too_many_peers = 0x04,
+    already_connected = 0x05,
+    incompatible_version = 0x06,
+    invalid_identity = 0x07,
+    client_quitting = 0x08,
+    unexpected_identity = 0x09,
+    same_identity = 0x0a,
+    timeout = 0x0b,
+    subprotocol_error = 0x10,
+};
+
+/// Hello message
+pub const Hello = struct {
+    protocol_version: u8 = 5,
+    client_id: []const u8,
+    capabilities: []Capability,
+    listen_port: u16 = 30303,
+    node_id: [64]u8 = [_]u8{0} ** 64,
+
+    pub const Capability = struct {
+        name: []const u8,
+        version: u8,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, client_id: []const u8, protocols: []const @import("server.zig").Protocol) !Hello {
+        var caps = try allocator.alloc(Capability, protocols.len);
+        for (protocols, 0..) |proto, i| {
+            caps[i] = .{
+                .name = proto.name,
+                .version = @intCast(proto.version),
+            };
+        }
+
+        return .{
+            .client_id = client_id,
+            .capabilities = caps,
+        };
+    }
+
+    pub fn deinit(self: *const Hello, allocator: std.mem.Allocator) void {
+        allocator.free(self.capabilities);
+    }
+
+    pub fn encode(self: *const Hello, allocator: std.mem.Allocator) ![]u8 {
+        const rlp = @import("../rlp.zig");
+        var encoder = rlp.Encoder.init(allocator);
+        defer encoder.deinit();
+
+        try encoder.startList();
+        try encoder.writeInt(self.protocol_version);
+        try encoder.writeBytes(self.client_id);
+
+        try encoder.startList();
+        for (self.capabilities) |cap| {
+            try encoder.startList();
+            try encoder.writeBytes(cap.name);
+            try encoder.writeInt(cap.version);
+            try encoder.endList();
+        }
+        try encoder.endList();
+
+        try encoder.writeInt(self.listen_port);
+        try encoder.writeBytes(&self.node_id);
+        try encoder.endList();
+
+        return encoder.toOwnedSlice();
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, data: []const u8) !Hello {
+        const rlp = @import("../rlp.zig");
+        var decoder = rlp.Decoder.init(data);
+        var list = try decoder.enterList();
+
+        const protocol_version: u8 = @intCast(try list.decodeInt());
+        const client_id = try allocator.dupe(u8, try list.decodeBytesView());
+
+        var caps = std.ArrayList(Capability).init(allocator);
+        var caps_list = try list.enterList();
+        while (!caps_list.isEmpty()) {
+            var cap_list = try caps_list.enterList();
+            const name = try allocator.dupe(u8, try cap_list.decodeBytesView());
+            const version: u8 = @intCast(try cap_list.decodeInt());
+            try caps.append(.{ .name = name, .version = version });
+        }
+
+        const listen_port: u16 = @intCast(try list.decodeInt());
+        const node_id_bytes = try list.decodeBytesView();
+        var node_id: [64]u8 = undefined;
+        @memcpy(&node_id, node_id_bytes[0..@min(64, node_id_bytes.len)]);
+
+        return .{
+            .protocol_version = protocol_version,
+            .client_id = client_id,
+            .capabilities = try caps.toOwnedSlice(),
+            .listen_port = listen_port,
+            .node_id = node_id,
+        };
+    }
+};
+
+/// Disconnect message
+pub const Disconnect = struct {
+    reason: DisconnectReason,
+
+    pub fn encode(self: *const Disconnect, allocator: std.mem.Allocator) ![]u8 {
+        const rlp = @import("../rlp.zig");
+        var encoder = rlp.Encoder.init(allocator);
+        defer encoder.deinit();
+
+        try encoder.startList();
+        try encoder.writeInt(@intFromEnum(self.reason));
+        try encoder.endList();
+
+        return encoder.toOwnedSlice();
+    }
+};
+
 /// Network message types (eth/68)
 pub const MessageType = enum(u8) {
     // Status exchange

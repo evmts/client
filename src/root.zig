@@ -5,6 +5,9 @@ const std = @import("std");
 pub const chain = @import("chain.zig");
 pub const database = @import("database.zig");
 pub const state = @import("state.zig");
+pub const intra_block_state = @import("intra_block_state.zig");
+pub const access_list = @import("access_list.zig");
+pub const execution = @import("execution.zig");
 pub const sync = @import("sync.zig");
 pub const node = @import("node.zig");
 pub const p2p = @import("p2p.zig");
@@ -12,12 +15,15 @@ pub const rpc = @import("rpc.zig");
 pub const rlp = @import("rlp.zig");
 pub const crypto = @import("crypto.zig");
 
+// Export trie modules
+pub const trie = @import("trie/trie.zig");
+pub const merkle_trie = @import("trie/merkle_trie.zig");
+pub const commitment = @import("trie/commitment.zig");
+
 // Export KV module
-pub const kv = struct {
-    pub usingnamespace @import("kv/kv.zig");
-    pub const tables = @import("kv/tables.zig");
-    pub const memdb = @import("kv/memdb.zig");
-};
+pub const kv = @import("kv/kv.zig");
+pub const kv_tables = @import("kv/tables.zig");
+pub const kv_memdb = @import("kv/memdb.zig");
 
 // Export stages
 pub const stages = struct {

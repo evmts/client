@@ -5,8 +5,9 @@
 //! Spec: https://github.com/ethereum/devp2p/blob/master/rlpx.md
 
 const std = @import("std");
-const crypto = @import("../crypto.zig");
-const rlp = @import("../rlp.zig");
+const crypto = @import("crypto");
+const primitives = @import("primitives");
+const rlp = primitives.rlp;
 
 /// RLPx connection wrapping a TCP socket
 pub const Conn = struct {

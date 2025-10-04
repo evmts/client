@@ -78,7 +78,7 @@ pub const Hello = struct {
     }
 
     pub fn encode(self: *const Hello, allocator: std.mem.Allocator) ![]u8 {
-        const rlp = @import("../rlp.zig");
+        const rlp = @import("primitives").rlp;
         var encoder = rlp.Encoder.init(allocator);
         defer encoder.deinit();
 
@@ -103,7 +103,7 @@ pub const Hello = struct {
     }
 
     pub fn decode(allocator: std.mem.Allocator, data: []const u8) !Hello {
-        const rlp = @import("../rlp.zig");
+        const rlp = @import("primitives").rlp;
         var decoder = rlp.Decoder.init(data);
         var list = try decoder.enterList();
 
@@ -139,7 +139,7 @@ pub const Disconnect = struct {
     reason: DisconnectReason,
 
     pub fn encode(self: *const Disconnect, allocator: std.mem.Allocator) ![]u8 {
-        const rlp = @import("../rlp.zig");
+        const rlp = @import("primitives").rlp;
         var encoder = rlp.Encoder.init(allocator);
         defer encoder.deinit();
 

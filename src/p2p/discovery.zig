@@ -5,8 +5,8 @@
 //! Spec: https://github.com/ethereum/devp2p/blob/master/discv4.md
 
 const std = @import("std");
-const crypto = @import("../crypto.zig");
-const rlp = @import("../rlp.zig");
+const crypto = @import("crypto");
+const rlp = @import("primitives").rlp;
 
 const PROTOCOL_VERSION: u8 = 4;
 const MAX_PACKET_SIZE: usize = 1280;

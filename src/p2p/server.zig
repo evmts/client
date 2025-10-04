@@ -2,7 +2,7 @@
 //! Based on Erigon's p2p/server.go
 
 const std = @import("std");
-const rlp = @import("../rlp.zig");
+const rlp = @import("primitives").rlp;
 const rlpx = @import("rlpx.zig");
 const discovery = @import("discovery.zig");
 const devp2p = @import("devp2p.zig");

@@ -119,6 +119,38 @@ pub const InvertedIndex = struct {
         return result.toOwnedSlice();
     }
 
+    /// Seek single transaction number for key
+    /// Returns the largest txNum <= target where this key was modified
+    ///
+    /// Algorithm (from inverted_index.go seekInFiles):
+    /// 1. Check files for key
+    /// 2. Use .efi index to find encoded sequence
+    /// 3. Binary search in Elias-Fano sequence for txNum
+    /// 4. Return equal or higher txNum
+    pub fn seekTxNum(self: *Self, key: []const u8, target_tx: u64) !?u64 {
+        // First check in-memory index
+        if (self.index.get(key)) |list| {
+            var result: ?u64 = null;
+            for (list.items) |tx| {
+                if (tx <= target_tx) {
+                    result = tx;
+                } else {
+                    break; // List is sorted, no need to continue
+                }
+            }
+            if (result) |r| return r;
+        }
+
+        // TODO: Check files (seekInFiles implementation)
+        // This would:
+        // 1. Hash the key (murmur3)
+        // 2. Look up in .efi index
+        // 3. Read compressed sequence from .ef
+        // 4. Binary search for largest txNum <= target
+
+        return null;
+    }
+
     /// Get all transaction numbers for key (no limit)
     pub fn get(self: *Self, key: []const u8) ![]u64 {
         var result = std.ArrayList(u64).init(self.allocator);

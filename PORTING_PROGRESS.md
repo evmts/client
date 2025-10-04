@@ -9,28 +9,35 @@
 
 ## Session 2 Summary (Current)
 
-### Files Enhanced This Session
-1. ✅ **src/crypto.zig** - Added ECIES encryption (155 lines added, 747 total)
+### Files Enhanced/Created This Session
+1. ✅ **src/crypto.zig** - Added ECDSA signing + ecrecover (165 lines added, 947 total)
 2. ✅ **src/p2p/rlpx.zig** - Complete RLPx v4 implementation (590 lines)
-3. ✅ **src/p2p/discovery.zig** - Packet encoding/decoding (668 lines)
-4. ✅ **PORTING_PROGRESS.md** - Comprehensive tracking document (created)
+3. ✅ **src/p2p/discovery.zig** - Full packet signing/verification (880+ lines)
+4. ✅ **STATE_DOMAIN_ARCHITECTURE.md** - State domain analysis (600+ lines)
+5. ✅ **DECOMPRESSOR_ARCHITECTURE.md** - Decompressor analysis (600+ lines)
+6. ✅ **src/kv/decompressor.zig** - Huffman decompressor (700+ lines)
+7. ✅ **PORTING_PROGRESS.md** - Comprehensive tracking document (created)
 
 ### Key Achievements
-- ✅ Implemented complete ECIES encryption for RLPx handshake
-- ✅ Ported RLPx MAC construction (the "horrible legacy thing")
-- ✅ Enhanced Discovery v4 with packet encode/decode
-- ✅ Added proper error handling throughout
-- ✅ Created systematic file-by-file tracking
+- ✅ Implemented complete ECDSA signing with deterministic k (RFC 6979)
+- ✅ Implemented ecrecover with public key recovery (sqrtmod, point arithmetic)
+- ✅ Integrated signatures into Discovery v4 packets
+- ✅ Deep architectural analysis of State Domain (O(1) flat storage)
+- ✅ Complete Decompressor port with Huffman coding + pattern dictionary
+- ✅ Created 2 major architecture documents (1,200+ lines)
 
 ### Lines of Code
-- **Erigon analyzed**: ~1,900 lines (v4wire.go, rlpx.go, buffer.go, ecies.go)
-- **Zig written**: ~450 lines (net new code this session)
-- **Compression ratio**: 4.2:1
+- **Erigon analyzed**: ~5,900 lines (domain.go, decompress.go, discovery, crypto)
+- **Zig written**: ~1,500 lines (net new code this session)
+- **Architecture docs**: ~1,200 lines
+- **Compression ratio**: 4:1 (Go → Zig)
 
-### Components Now at 90%+
-- RLPx protocol: 95% → Full handshake + encryption
-- Discovery wire: 40% → Packet encoding complete
-- Crypto: 100% → ECIES added
+### Components Now Complete
+- ✅ Crypto: 100% → ECIES + ECDSA signing + ecrecover
+- ✅ RLPx protocol: 95% → Full handshake + encryption
+- ✅ Discovery wire: 90% → Packet signing/verification complete
+- ✅ Decompressor: 100% → Full Huffman + pattern dict implementation
+- ⚡ State Domain: 40% → Basic structures + decompressor ready
 
 ---
 
@@ -247,16 +254,30 @@ pub const Bucket = struct {
 
 ### 🔥 CRITICAL PERFORMANCE (State Management)
 
-#### 3. State Domain/History/InvertedIndex ❌ (NOT STARTED)
-**Status**: 0% complete
+#### 3. State Domain/History/InvertedIndex ⚡ (IN PROGRESS - 40%)
+**Status**: 40% complete
 **Estimated Work**: ~4,676 lines → ~2,000-2,500 Zig lines
 
 This is **THE** performance differentiator of Erigon - flat state storage without intermediate trie nodes.
 
 **Erigon Files** (Total: 4,676 lines):
-1. `db/state/domain.go` (2,005 lines)
-2. `db/state/history.go` (1,419 lines)
-3. `db/state/inverted_index.go` (1,252 lines)
+1. ✅ `db/state/domain.go` (2,005 lines) - analyzed, doc created
+2. ⚡ `db/seg/decompress.go` (1,049 lines) - PORTED to decompressor.zig (700 lines)
+3. ⏳ `db/state/history.go` (1,419 lines) - next
+4. ⏳ `db/state/inverted_index.go` (1,252 lines) - pending
+
+**What's Complete**:
+- ✅ STATE_DOMAIN_ARCHITECTURE.md - comprehensive analysis (600 lines)
+- ✅ DECOMPRESSOR_ARCHITECTURE.md - decompressor analysis (600 lines)
+- ✅ src/state/domain.zig - basic structures exist (300 lines)
+- ✅ src/kv/decompressor.zig - complete Huffman decompressor (700 lines)
+
+**What's Remaining**:
+- ⏳ Index support (.bt B-tree, .kvi hash, .kvei bloom filters)
+- ⏳ History integration for time-travel queries
+- ⏳ InvertedIndex with Roaring bitmaps
+- ⏳ File collation and merging
+- ⏳ Integration tests with real Erigon .kv files
 
 **Key Concepts** (from analysis):
 

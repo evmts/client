@@ -56,7 +56,7 @@ pub const Hash = struct {
         }
     }
 
-    pub fn fromHex(allocator: std.mem.Allocator, s: []const u8) !Hash {
+    pub fn fromHex(_: std.mem.Allocator, s: []const u8) !Hash {
         const hex_str = if (std.mem.startsWith(u8, s, "0x"))
             s[2..]
         else

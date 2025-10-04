@@ -515,24 +515,6 @@ fn sqrtmod(a: u256, p: u256) ?u256 {
     return null;
 }
 
-/// Modular exponentiation: base^exp mod m
-fn powmod(base: u256, exp: u256, m: u256) u256 {
-    if (m == 1) return 0;
-
-    var result: u256 = 1;
-    var b = base % m;
-    var e = exp;
-
-    while (e > 0) {
-        if (e & 1 == 1) {
-            result = mulmod(result, b, m);
-        }
-        e >>= 1;
-        b = mulmod(b, b, m);
-    }
-
-    return result;
-}
 
 test "keccak256" {
     const data = "hello";

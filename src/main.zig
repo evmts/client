@@ -120,14 +120,15 @@ pub fn main() !void {
     // Platform-specific signal handling
     if (@import("builtin").os.tag != .windows) {
         // Setup SIGINT (Ctrl+C) and SIGTERM handlers
+        const empty_set = std.posix.sigemptyset();
         const sigaction = std.posix.Sigaction{
             .handler = .{ .handler = handleSignal },
-            .mask = std.posix.empty_sigset,
+            .mask = empty_set,
             .flags = 0,
         };
 
-        try std.posix.sigaction(std.posix.SIG.INT, &sigaction, null);
-        try std.posix.sigaction(std.posix.SIG.TERM, &sigaction, null);
+        std.posix.sigaction(std.posix.SIG.INT, &sigaction, null);
+        std.posix.sigaction(std.posix.SIG.TERM, &sigaction, null);
 
         // Store shutdown flag in thread-local storage for signal handler
         shutdown_flag = &shutdown_requested;

@@ -704,7 +704,7 @@ fn Channel(comptime T: type) type {
         pub fn send(self: *Self, item: T) !void {
             self.mutex.lock();
             defer self.mutex.unlock();
-            try self.queue.append(item);
+            try self.queue.append(self.allocator, item);
         }
 
         pub fn tryReceive(self: *Self) ?T {

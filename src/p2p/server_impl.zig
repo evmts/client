@@ -321,10 +321,11 @@ pub fn setupConn(self: *Server, fd: std.net.Stream, flags: u32, dial_dest: ?disc
     errdefer conn.deinit();
 
     // Initialize transport
+    const stream = net.Stream{ .handle = fd };
     if (dial_dest) |dest| {
-        conn.transport = try rlpx.Conn.init(self.allocator, fd, &dest.id);
+        conn.transport = rlpx.Conn.init(self.allocator, stream, dest.id);
     } else {
-        conn.transport = try rlpx.Conn.init(self.allocator, fd, null);
+        conn.transport = rlpx.Conn.init(self.allocator, stream, null);
     }
 
     // Run the handshake sequence

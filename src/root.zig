@@ -1,23 +1,39 @@
-//! By convention, root.zig is the root source file when making a library.
+//! Ethereum Client Library - Main module exports
 const std = @import("std");
 
-pub fn bufferedPrint() !void {
-    // Stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-    const stdout = &stdout_writer.interface;
+// Export all modules
+pub const chain = @import("chain.zig");
+pub const database = @import("database.zig");
+pub const state = @import("state.zig");
+pub const sync = @import("sync.zig");
+pub const node = @import("node.zig");
+pub const p2p = @import("p2p.zig");
+pub const rpc = @import("rpc.zig");
+pub const rlp = @import("rlp.zig");
+pub const crypto = @import("crypto.zig");
 
-    try stdout.print("Run `zig build test` to run the tests.\n", .{});
+// Export KV module
+pub const kv = struct {
+    pub usingnamespace @import("kv/kv.zig");
+    pub const tables = @import("kv/tables.zig");
+    pub const memdb = @import("kv/memdb.zig");
+};
 
-    try stdout.flush(); // Don't forget to flush!
-}
+// Export stages
+pub const stages = struct {
+    pub const headers = @import("stages/headers.zig");
+    pub const bodies = @import("stages/bodies.zig");
+    pub const execution = @import("stages/execution.zig");
+};
 
-pub fn add(a: i32, b: i32) i32 {
-    return a + b;
-}
+// Re-export common types
+pub const Header = chain.Header;
+pub const Transaction = chain.Transaction;
+pub const Block = chain.Block;
+pub const Receipt = chain.Receipt;
+pub const U256 = chain.U256;
 
-test "basic add functionality" {
-    try std.testing.expect(add(3, 7) == 10);
+test {
+    // This will run all tests in imported modules
+    std.testing.refAllDecls(@This());
 }

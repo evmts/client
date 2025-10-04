@@ -61,7 +61,7 @@ pub const LegacyTx = struct {
             return U256.zero();
         }
 
-        var effective_fee = gas_fee_cap.sub(bf);
+        const effective_fee = gas_fee_cap.sub(bf);
         const tip_cap = self.getTipCap();
 
         if (tip_cap.lt(effective_fee)) {

@@ -210,24 +210,14 @@ pub const Transaction = union(TxType) {
 
     /// Calculate signing hash
     pub fn signingHash(self: Transaction, allocator: std.mem.Allocator, chain_id: ?U256) !Hash {
+        // Note: chain_id is only used for legacy transactions (EIP-155 replay protection)
+        // Other tx types have chain_id embedded in their structure
         return switch (self) {
             .legacy => |tx| try tx.signingHash(allocator, chain_id),
-            .access_list => |tx| {
-                _ = chain_id; // access_list has its own chain_id
-                return try tx.signingHash(allocator);
-            },
-            .dynamic_fee => |tx| {
-                _ = chain_id; // dynamic_fee has its own chain_id
-                return try tx.signingHash(allocator);
-            },
-            .blob => |tx| {
-                _ = chain_id; // blob has its own chain_id
-                return try tx.signingHash(allocator);
-            },
-            .set_code => |tx| {
-                _ = chain_id; // set_code has its own chain_id
-                return try tx.signingHash(allocator);
-            },
+            .access_list => |tx| try tx.signingHash(allocator),
+            .dynamic_fee => |tx| try tx.signingHash(allocator),
+            .blob => |tx| try tx.signingHash(allocator),
+            .set_code => |tx| try tx.signingHash(allocator),
         };
     }
 

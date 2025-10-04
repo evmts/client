@@ -44,35 +44,35 @@ pub const Bloom = struct {
         std.crypto.hash.sha3.Keccak256.hash(data, &hash_buf, .{});
 
         // Add 3 bits to bloom from hash
-        const i1 = BLOOM_BYTE_LENGTH - ((std.mem.readInt(u16, hash_buf[0..2], .big) & 0x7ff) >> 3) - 1;
-        const i2 = BLOOM_BYTE_LENGTH - ((std.mem.readInt(u16, hash_buf[2..4], .big) & 0x7ff) >> 3) - 1;
-        const i3 = BLOOM_BYTE_LENGTH - ((std.mem.readInt(u16, hash_buf[4..6], .big) & 0x7ff) >> 3) - 1;
+        const idx1 = BLOOM_BYTE_LENGTH - ((std.mem.readInt(u16, hash_buf[0..2], .big) & 0x7ff) >> 3) - 1;
+        const idx2 = BLOOM_BYTE_LENGTH - ((std.mem.readInt(u16, hash_buf[2..4], .big) & 0x7ff) >> 3) - 1;
+        const idx3 = BLOOM_BYTE_LENGTH - ((std.mem.readInt(u16, hash_buf[4..6], .big) & 0x7ff) >> 3) - 1;
 
         const v1: u8 = 1 << @as(u3, @intCast(hash_buf[0] & 0x7));
         const v2: u8 = 1 << @as(u3, @intCast(hash_buf[2] & 0x7));
         const v3: u8 = 1 << @as(u3, @intCast(hash_buf[4] & 0x7));
 
-        self.bytes[i1] |= v1;
-        self.bytes[i2] |= v2;
-        self.bytes[i3] |= v3;
+        self.bytes[idx1] |= v1;
+        self.bytes[idx2] |= v2;
+        self.bytes[idx3] |= v3;
     }
 
     /// Test if bloom filter might contain a value
-    pub fn test(self: Bloom, data: []const u8) bool {
+    pub fn contains(self: Bloom, data: []const u8) bool {
         var hash_buf: [32]u8 = undefined;
         std.crypto.hash.sha3.Keccak256.hash(data, &hash_buf, .{});
 
-        const i1 = BLOOM_BYTE_LENGTH - ((std.mem.readInt(u16, hash_buf[0..2], .big) & 0x7ff) >> 3) - 1;
-        const i2 = BLOOM_BYTE_LENGTH - ((std.mem.readInt(u16, hash_buf[2..4], .big) & 0x7ff) >> 3) - 1;
-        const i3 = BLOOM_BYTE_LENGTH - ((std.mem.readInt(u16, hash_buf[4..6], .big) & 0x7ff) >> 3) - 1;
+        const idx1 = BLOOM_BYTE_LENGTH - ((std.mem.readInt(u16, hash_buf[0..2], .big) & 0x7ff) >> 3) - 1;
+        const idx2 = BLOOM_BYTE_LENGTH - ((std.mem.readInt(u16, hash_buf[2..4], .big) & 0x7ff) >> 3) - 1;
+        const idx3 = BLOOM_BYTE_LENGTH - ((std.mem.readInt(u16, hash_buf[4..6], .big) & 0x7ff) >> 3) - 1;
 
         const v1: u8 = 1 << @as(u3, @intCast(hash_buf[0] & 0x7));
         const v2: u8 = 1 << @as(u3, @intCast(hash_buf[2] & 0x7));
         const v3: u8 = 1 << @as(u3, @intCast(hash_buf[4] & 0x7));
 
-        return (self.bytes[i1] & v1) == v1 and
-            (self.bytes[i2] & v2) == v2 and
-            (self.bytes[i3] & v3) == v3;
+        return (self.bytes[idx1] & v1) == v1 and
+            (self.bytes[idx2] & v2) == v2 and
+            (self.bytes[idx3] & v3) == v3;
     }
 };
 
@@ -383,8 +383,8 @@ test "Bloom - add and test" {
     const data = "test data";
     bloom.add(data);
 
-    try testing.expect(bloom.test(data));
-    try testing.expect(!bloom.test("other data"));
+    try testing.expect(bloom.contains(data));
+    try testing.expect(!bloom.contains("other data"));
 }
 
 test "BlockNonce - conversion" {

@@ -95,7 +95,7 @@ pub const BlobTx = struct {
         return GAS_PER_BLOB * @as(u64, @intCast(self.blob_versioned_hashes.len));
     }
 
-    pub fn isContractCreation(self: BlobTx) bool {
+    pub fn isContractCreation(_: BlobTx) bool {
         // Blob transactions MUST have a 'to' field (cannot be contract creation)
         return false;
     }
@@ -255,8 +255,8 @@ pub const BlobTx = struct {
 
         // BlobVersionedHashes
         try encoder.startList();
-        for (self.blob_versioned_hashes) |hash| {
-            try encoder.writeBytes(&hash.bytes);
+        for (self.blob_versioned_hashes) |h| {
+            try encoder.writeBytes(&h.bytes);
         }
         try encoder.endList();
 
@@ -352,8 +352,8 @@ pub const BlobTx = struct {
 
         // BlobVersionedHashes
         try encoder.startList();
-        for (self.blob_versioned_hashes) |hash| {
-            try encoder.writeBytes(&hash.bytes);
+        for (self.blob_versioned_hashes) |h| {
+            try encoder.writeBytes(&h.bytes);
         }
         try encoder.endList();
 

@@ -44,7 +44,7 @@ pub const AccessTuple = struct {
 pub const AccessList = struct {
     tuples: []AccessTuple,
 
-    pub fn init(allocator: std.mem.Allocator) AccessList {
+    pub fn init(_: std.mem.Allocator) AccessList {
         return .{ .tuples = &[_]AccessTuple{} };
     }
 

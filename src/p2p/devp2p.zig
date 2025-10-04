@@ -307,7 +307,6 @@ pub const Peer = struct {
         });
 
         // In production: Encode message with RLPx framing
-        _ = data;
     }
 
     pub fn disconnect(self: *Peer, reason: []const u8) void {

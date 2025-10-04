@@ -126,7 +126,7 @@ pub const Conn = struct {
         const payload = try decoder.decodeBytesView();
 
         // Decompress if snappy enabled
-        var final_payload = payload;
+        const final_payload = payload;
         if (self.snappy_enabled) {
             // TODO: Snappy decompression
             // For now, just use raw payload
@@ -143,7 +143,7 @@ pub const Conn = struct {
         if (self.session == null) return error.NoSession;
 
         // Compress if snappy enabled
-        var final_payload = payload;
+        const final_payload = payload;
         if (self.snappy_enabled) {
             // TODO: Snappy compression
         }
@@ -245,11 +245,11 @@ pub const Conn = struct {
         const shared_secret = try crypto.ECIES.generateShared(priv_key_fixed, initiator_pub);
 
         // Store ephemeral public key (extracted from signature verification - simplified here)
-        var ephemeral_pub = try self.allocator.alloc(u8, 64);
+        const ephemeral_pub = try self.allocator.alloc(u8, 64);
         @memset(ephemeral_pub, 0); // Placeholder
 
         // Store shared secret
-        var shared_copy = try self.allocator.alloc(u8, 32);
+        const shared_copy = try self.allocator.alloc(u8, 32);
         @memcpy(shared_copy, &shared_secret);
 
         return InitiatorInfo{
@@ -258,7 +258,7 @@ pub const Conn = struct {
         };
     }
 
-    fn makeAuthAck(self: *Self, ephemeral_priv: []const u8, shared_secret: []const u8) ![]u8 {
+    fn makeAuthAck(self: *Self, ephemeral_priv: []const u8, _: []const u8) ![]u8 {
         // Create auth-ack message according to RLPx spec
         // auth-ack = E(remote-pubk, remote-ephemeral-pubk || nonce || 0x0)
 
@@ -304,7 +304,7 @@ pub const Conn = struct {
         if (ack_plain.len < 97) return error.InvalidAckMessage;
 
         // Extract remote ephemeral public key
-        var remote_ephemeral_pub = try self.allocator.alloc(u8, 64);
+        const remote_ephemeral_pub = try self.allocator.alloc(u8, 64);
         @memcpy(remote_ephemeral_pub, ack_plain[0..64]);
 
         return remote_ephemeral_pub;

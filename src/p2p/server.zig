@@ -2,6 +2,7 @@
 //! Based on Erigon's p2p/server.go
 
 const std = @import("std");
+const rlp = @import("../rlp.zig");
 const rlpx = @import("rlpx.zig");
 const discovery = @import("discovery.zig");
 const devp2p = @import("devp2p.zig");
@@ -586,8 +587,8 @@ pub const Peer = struct {
         std.log.info("Disconnecting peer {s}: {}", .{ self.name, reason });
 
         // Send disconnect message
-        const disconnect = devp2p.Disconnect{ .reason = reason };
-        const payload = disconnect.encode(self.allocator) catch {
+        const disconnect_msg = devp2p.Disconnect{ .reason = reason };
+        const payload = disconnect_msg.encode(self.allocator) catch {
             self.state = .disconnected;
             self.running = false;
             return;

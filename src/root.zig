@@ -15,6 +15,10 @@ pub const rpc = @import("rpc.zig");
 pub const rlp = @import("rlp.zig");
 pub const crypto = @import("crypto.zig");
 
+// Export common utilities
+pub const common_types = @import("common/types.zig");
+pub const common_bytes = @import("common/bytes.zig");
+
 // Export trie modules
 pub const trie = @import("trie/trie.zig");
 pub const merkle_trie = @import("trie/merkle_trie.zig");

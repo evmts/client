@@ -7,7 +7,8 @@
 //! - Proof creation
 
 const std = @import("std");
-const primitives = @import("primitives");
+const MerkleTrie = @import("merkle_trie.zig").MerkleTrie;
+const rlp = @import("../rlp.zig");
 
 /// Commitment mode
 pub const Mode = enum {
@@ -19,85 +20,32 @@ pub const Mode = enum {
     disabled,
 };
 
-/// Node types in Merkle Patricia Trie
-pub const NodeType = enum {
-    empty,
-    branch,
-    extension,
-    leaf,
-    hash,
-};
-
-/// Trie node
-pub const TrieNode = union(NodeType) {
-    empty: void,
-    branch: BranchNode,
-    extension: ExtensionNode,
-    leaf: LeafNode,
-    hash: [32]u8,
-
-    pub const BranchNode = struct {
-        children: [16]?*TrieNode,
-        value: ?[]const u8,
-    };
-
-    pub const ExtensionNode = struct {
-        path: []const u8,
-        child: *TrieNode,
-    };
-
-    pub const LeafNode = struct {
-        path: []const u8,
-        value: []const u8,
-    };
-};
-
 /// Commitment builder for state root calculation
 pub const CommitmentBuilder = struct {
     allocator: std.mem.Allocator,
     mode: Mode,
-    /// Cached nodes for incremental updates
-    cache: std.StringHashMap(*TrieNode),
+    /// Account trie
+    account_trie: MerkleTrie,
+    /// Storage tries per account (keyed by address)
+    storage_tries: std.AutoHashMap([20]u8, MerkleTrie),
 
     pub fn init(allocator: std.mem.Allocator, mode: Mode) CommitmentBuilder {
         return .{
             .allocator = allocator,
             .mode = mode,
-            .cache = std.StringHashMap(*TrieNode).init(allocator),
+            .account_trie = MerkleTrie.init(allocator),
+            .storage_tries = std.AutoHashMap([20]u8, MerkleTrie).init(allocator),
         };
     }
 
     pub fn deinit(self: *CommitmentBuilder) void {
-        var iter = self.cache.valueIterator();
-        while (iter.next()) |node_ptr| {
-            self.freeNode(node_ptr.*);
-        }
-        self.cache.deinit();
-    }
+        self.account_trie.deinit();
 
-    fn freeNode(self: *CommitmentBuilder, node: *TrieNode) void {
-        switch (node.*) {
-            .branch => |branch| {
-                for (branch.children) |child_opt| {
-                    if (child_opt) |child| {
-                        self.freeNode(child);
-                    }
-                }
-                if (branch.value) |v| {
-                    self.allocator.free(v);
-                }
-            },
-            .extension => |ext| {
-                self.allocator.free(ext.path);
-                self.freeNode(ext.child);
-            },
-            .leaf => |leaf| {
-                self.allocator.free(leaf.path);
-                self.allocator.free(leaf.value);
-            },
-            else => {},
+        var iter = self.storage_tries.valueIterator();
+        while (iter.next()) |trie| {
+            trie.deinit();
         }
-        self.allocator.destroy(node);
+        self.storage_tries.deinit();
     }
 
     /// Update account in commitment
@@ -111,7 +59,7 @@ pub const CommitmentBuilder = struct {
     ) !void {
         if (self.mode == .disabled) return;
 
-        // Encode account data
+        // Encode account data using RLP
         const account_data = try self.encodeAccount(
             nonce,
             balance,
@@ -120,18 +68,46 @@ pub const CommitmentBuilder = struct {
         );
         defer self.allocator.free(account_data);
 
-        // Hash address for key
-        const key_hash = std.crypto.hash.sha3.Keccak256.hash(&address, .{});
+        // Hash address for key (Keccak256)
+        var key_hash: [32]u8 = undefined;
+        std.crypto.hash.sha3.Keccak256.hash(&address, &key_hash, .{});
 
-        // Update trie (simplified - full implementation would update merkle path)
-        try self.cache.put(std.fmt.bytesToHex(&key_hash, .lower), @constCast(&TrieNode{
-            .leaf = .{
-                .path = try self.allocator.dupe(u8, &key_hash),
-                .value = try self.allocator.dupe(u8, account_data),
-            },
-        }));
+        // Update account trie
+        try self.account_trie.put(&key_hash, account_data);
     }
 
+    /// Update storage slot for an account
+    pub fn updateStorage(
+        self: *CommitmentBuilder,
+        address: [20]u8,
+        slot: [32]u8,
+        value: [32]u8,
+    ) !void {
+        if (self.mode == .disabled) return;
+
+        // Get or create storage trie for this account
+        const result = try self.storage_tries.getOrPut(address);
+        if (!result.found_existing) {
+            result.value_ptr.* = MerkleTrie.init(self.allocator);
+        }
+
+        // Hash slot for key
+        var slot_hash: [32]u8 = undefined;
+        std.crypto.hash.sha3.Keccak256.hash(&slot, &slot_hash, .{});
+
+        // Update storage trie
+        if (std.mem.eql(u8, &value, &[_]u8{0} ** 32)) {
+            // Delete zero values
+            try result.value_ptr.delete(&slot_hash);
+        } else {
+            // Encode non-zero value with RLP
+            const encoded_value = try rlp.encodeBytes(self.allocator, &value);
+            defer self.allocator.free(encoded_value);
+            try result.value_ptr.put(&slot_hash, encoded_value);
+        }
+    }
+
+    /// Encode account using RLP: [nonce, balance, storage_root, code_hash]
     fn encodeAccount(
         self: *CommitmentBuilder,
         nonce: u64,
@@ -139,18 +115,17 @@ pub const CommitmentBuilder = struct {
         code_hash: [32]u8,
         storage_root: [32]u8,
     ) ![]u8 {
-        // RLP encode: [nonce, balance, storage_root, code_hash]
-        // Simplified version
-        var result = std.ArrayList(u8).empty;
-        defer result.deinit(self.allocator);
+        var encoder = rlp.Encoder.init(self.allocator);
+        defer encoder.deinit();
 
-        const nonce_bytes = std.mem.toBytes(nonce);
-        try result.appendSlice(self.allocator, &nonce_bytes);
-        try result.appendSlice(self.allocator, &balance);
-        try result.appendSlice(self.allocator, &storage_root);
-        try result.appendSlice(self.allocator, &code_hash);
+        try encoder.startList();
+        try encoder.writeInt(nonce);
+        try encoder.writeBytes(&balance);
+        try encoder.writeBytes(&storage_root);
+        try encoder.writeBytes(&code_hash);
+        try encoder.endList();
 
-        return result.toOwnedSlice(self.allocator);
+        return try encoder.toOwnedSlice();
     }
 
     /// Calculate state root
@@ -159,68 +134,51 @@ pub const CommitmentBuilder = struct {
             return [_]u8{0} ** 32;
         }
 
-        // In production: Build full trie from cache, hash all nodes
-        // Simplified: Hash all leaf values
-        var hasher = std.crypto.hash.sha3.Keccak256.init(.{});
+        // Update all account storage roots
+        var iter = self.storage_tries.iterator();
+        while (iter.next()) |entry| {
+            const address = entry.key_ptr.*;
+            const storage_trie = entry.value_ptr.*;
 
-        var iter = self.cache.valueIterator();
-        while (iter.next()) |node_ptr| {
-            const node_hash = try self.hashNode(node_ptr.*);
-            hasher.update(&node_hash);
+            // Get storage root
+            const storage_root = storage_trie.root_hash() orelse [_]u8{0} ** 32;
+
+            // Get current account data and update with new storage root
+            var addr_hash: [32]u8 = undefined;
+            std.crypto.hash.sha3.Keccak256.hash(&address, &addr_hash, .{});
+
+            if (try self.account_trie.get(&addr_hash)) |account_data| {
+                // Decode, update storage root, re-encode
+                var decoder = try rlp.Decoder.init(account_data);
+                try decoder.enterList();
+
+                const nonce = try decoder.decodeInt(u64);
+                const balance_view = try decoder.decodeBytesView();
+                var balance: [32]u8 = undefined;
+                @memcpy(&balance, balance_view);
+
+                _ = try decoder.decodeBytesView(); // Skip old storage root
+                const code_hash_view = try decoder.decodeBytesView();
+                var code_hash: [32]u8 = undefined;
+                @memcpy(&code_hash, code_hash_view);
+
+                try self.updateAccount(address, nonce, balance, code_hash, storage_root);
+            }
         }
 
-        var result: [32]u8 = undefined;
-        hasher.final(&result);
-        return result;
+        return self.account_trie.root_hash() orelse [_]u8{0} ** 32;
     }
 
-    fn hashNode(self: *CommitmentBuilder, node: *TrieNode) ![32]u8 {
-        _ = self;
-        switch (node.*) {
-            .leaf => |leaf| {
-                return std.crypto.hash.sha3.Keccak256.hash(leaf.value, .{});
-            },
-            .hash => |h| {
-                return h;
-            },
-            else => {
-                return [_]u8{0} ** 32;
-            },
+    /// Get storage root for an account
+    pub fn getStorageRoot(self: *CommitmentBuilder, address: [20]u8) [32]u8 {
+        if (self.storage_tries.get(address)) |trie| {
+            return trie.root_hash() orelse [_]u8{0} ** 32;
         }
+        return [_]u8{0} ** 32;
     }
 };
 
-/// Hex prefix encoding for trie keys
-pub fn hexPrefixEncode(nibbles: []const u8, is_leaf: bool) ![]u8 {
-    const allocator = std.heap.page_allocator;
-    const odd_len = nibbles.len % 2 == 1;
-
-    var result = std.ArrayList(u8).empty;
-    defer result.deinit(allocator);
-
-    // First byte encodes oddness and leaf status
-    if (odd_len) {
-        const prefix: u8 = if (is_leaf) 0x30 else 0x10;
-        try result.append(allocator, prefix + nibbles[0]);
-
-        var i: usize = 1;
-        while (i < nibbles.len) : (i += 2) {
-            try result.append(allocator, nibbles[i] * 16 + nibbles[i + 1]);
-        }
-    } else {
-        const prefix: u8 = if (is_leaf) 0x20 else 0x00;
-        try result.append(allocator, prefix);
-
-        var i: usize = 0;
-        while (i < nibbles.len) : (i += 2) {
-            try result.append(allocator, nibbles[i] * 16 + nibbles[i + 1]);
-        }
-    }
-
-    return result.toOwnedSlice(allocator);
-}
-
-test "commitment builder" {
+test "commitment builder - account updates" {
     var builder = CommitmentBuilder.init(std.testing.allocator, .commitment_only);
     defer builder.deinit();
 
@@ -235,4 +193,28 @@ test "commitment builder" {
 
     const root = try builder.calculateRoot();
     try std.testing.expect(root.len == 32);
+}
+
+test "commitment builder - storage updates" {
+    var builder = CommitmentBuilder.init(std.testing.allocator, .commitment_only);
+    defer builder.deinit();
+
+    const addr = [_]u8{1} ** 20;
+
+    // Add account first
+    try builder.updateAccount(
+        addr,
+        1,
+        [_]u8{0} ** 32,
+        [_]u8{0} ** 32,
+        [_]u8{0} ** 32,
+    );
+
+    // Update storage
+    const slot = [_]u8{2} ** 32;
+    const value = [_]u8{3} ** 32;
+    try builder.updateStorage(addr, slot, value);
+
+    const storage_root = builder.getStorageRoot(addr);
+    try std.testing.expect(!std.mem.eql(u8, &storage_root, &[_]u8{0} ** 32));
 }

@@ -62,6 +62,8 @@ pub const RpcServer = struct {
     node: *node_mod.Node,
     port: u16,
     running: bool,
+    server_thread: ?std.Thread,
+    shutdown_requested: std.atomic.Value(bool),
 
     pub fn init(allocator: std.mem.Allocator, node: *node_mod.Node, port: u16) RpcServer {
         return .{
@@ -69,6 +71,8 @@ pub const RpcServer = struct {
             .node = node,
             .port = port,
             .running = false,
+            .server_thread = null,
+            .shutdown_requested = std.atomic.Value(bool).init(false),
         };
     }
 
@@ -76,12 +80,151 @@ pub const RpcServer = struct {
     pub fn start(self: *RpcServer) !void {
         self.running = true;
         std.log.info("RPC server listening on port {}", .{self.port});
+
         // In production: Start HTTP server and handle requests
+        // Create TCP listener on the specified port
+        const address = try std.net.Address.parseIp("0.0.0.0", self.port);
+        var listener = try address.listen(.{
+            .reuse_address = true,
+        });
+        errdefer listener.deinit();
+
+        std.log.info("HTTP server started on http://0.0.0.0:{d}", .{self.port});
+
+        // Spawn thread to handle connections
+        self.server_thread = try std.Thread.spawn(.{}, serverLoop, .{ self, listener });
     }
+
+    /// Server event loop - accepts connections and handles HTTP requests
+    fn serverLoop(self: *RpcServer, listener_: std.net.Server) void {
+        var listener = listener_;
+        defer listener.deinit();
+
+        while (!self.shutdown_requested.load(.acquire)) {
+            // Accept connection with timeout to allow checking shutdown flag
+            const connection = listener.accept() catch |err| {
+                if (self.shutdown_requested.load(.acquire)) break;
+                std.log.warn("Failed to accept connection: {}", .{err});
+                std.Thread.sleep(100 * std.time.ns_per_ms);
+                continue;
+            };
+
+            // Handle request in the same thread (simplified - production would use thread pool)
+            self.handleConnection(connection) catch |err| {
+                std.log.warn("Error handling connection: {}", .{err});
+            };
+        }
+    }
+
+    /// Handle a single HTTP connection
+    fn handleConnection(self: *RpcServer, connection: std.net.Server.Connection) !void {
+        defer connection.stream.close();
+
+        var buffer: [8192]u8 = undefined;
+        const bytes_read = try connection.stream.read(&buffer);
+        if (bytes_read == 0) return;
+
+        // Parse HTTP request headers (simplified)
+        const request_data = buffer[0..bytes_read];
+
+        // Find the JSON-RPC request body (after headers)
+        const body_start = std.mem.indexOf(u8, request_data, "\r\n\r\n") orelse return error.InvalidRequest;
+        const body = request_data[body_start + 4 ..];
+
+        // Parse JSON-RPC request
+        const parsed = std.json.parseFromSlice(
+            JsonRpcRequest,
+            self.allocator,
+            body,
+            .{ .ignore_unknown_fields = true },
+        ) catch {
+            return self.sendErrorResponse(connection.stream, null, -32700, "Parse error");
+        };
+        defer parsed.deinit();
+
+        const req = parsed.value;
+
+        // Validate JSON-RPC version
+        if (!std.mem.eql(u8, req.jsonrpc, "2.0")) {
+            return self.sendErrorResponse(connection.stream, req.id, -32600, "Invalid Request");
+        }
+
+        // Handle the RPC method
+        const result = self.handleRequest(req.method, req.params) catch |err| {
+            std.log.warn("Error handling method {s}: {}", .{ req.method, err });
+            return self.sendErrorResponse(connection.stream, req.id, -32603, "Internal error");
+        };
+        defer if (result.len > 0) self.allocator.free(result);
+
+        // Send JSON-RPC response
+        try self.sendSuccessResponse(connection.stream, req.id, result);
+    }
+
+    /// Send JSON-RPC success response
+    fn sendSuccessResponse(self: *RpcServer, stream: std.net.Stream, id: ?std.json.Value, result: []const u8) !void {
+        const id_str = if (id) |i| blk: {
+            if (i == .integer) {
+                break :blk try std.fmt.allocPrint(self.allocator, "{d}", .{i.integer});
+            } else if (i == .string) {
+                break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{i.string});
+            } else {
+                break :blk try self.allocator.dupe(u8, "null");
+            }
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(id_str);
+
+        const response = try std.fmt.allocPrint(
+            self.allocator,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{s}}}",
+            .{ id_str, result },
+        );
+        defer self.allocator.free(response);
+
+        _ = try stream.writeAll(response);
+    }
+
+    /// Send JSON-RPC error response
+    fn sendErrorResponse(self: *RpcServer, stream: std.net.Stream, id: ?std.json.Value, code: i32, message: []const u8) !void {
+        const id_str = if (id) |i| blk: {
+            if (i == .integer) {
+                break :blk try std.fmt.allocPrint(self.allocator, "{d}", .{i.integer});
+            } else if (i == .string) {
+                break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{i.string});
+            } else {
+                break :blk try self.allocator.dupe(u8, "null");
+            }
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(id_str);
+
+        const response = try std.fmt.allocPrint(
+            self.allocator,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{{\"jsonrpc\":\"2.0\",\"id\":{s},\"error\":{{\"code\":{d},\"message\":\"{s}\"}}}}",
+            .{ id_str, code, message },
+        );
+        defer self.allocator.free(response);
+
+        _ = try stream.writeAll(response);
+    }
+
+    /// JSON-RPC request structure
+    const JsonRpcRequest = struct {
+        jsonrpc: []const u8,
+        method: []const u8,
+        params: []const u8,
+        id: ?std.json.Value = null,
+    };
 
     /// Stop the RPC server
     pub fn stop(self: *RpcServer) void {
         self.running = false;
+        self.shutdown_requested.store(true, .release);
+
+        // Wait for server thread to finish
+        if (self.server_thread) |thread| {
+            thread.join();
+            self.server_thread = null;
+        }
+
         std.log.info("RPC server stopped", .{});
     }
 
@@ -219,13 +362,14 @@ pub const RpcServer = struct {
     }
 
     fn handlePeerCount(self: *RpcServer) ![]const u8 {
-        const count = self.node.network.getPeerCount();
+        // TODO: Access network manager from node context
+        const count: usize = 0; // Placeholder
         return try std.fmt.allocPrint(self.allocator, "\"0x{x}\"", .{count});
     }
 
-    fn handleListening(self: *RpcServer) ![]const u8 {
-        const listening = self.node.network.listening;
-        return if (listening) "true" else "false";
+    fn handleListening(_: *RpcServer) ![]const u8 {
+        // TODO: Access network manager from node context
+        return "false"; // Placeholder
     }
 
     fn handleSha3(self: *RpcServer) ![]const u8 {

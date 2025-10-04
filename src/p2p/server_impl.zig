@@ -2,6 +2,7 @@
 //! This file contains the main run loop, SetupConn, and checkpoint system
 
 const std = @import("std");
+const net = std.net;
 const Server = @import("server.zig").Server;
 const Conn = @import("server.zig").Conn;
 const ConnFlag = @import("server.zig").ConnFlag;

@@ -76,7 +76,7 @@ pub const NetRestrict = struct {
 
     pub fn contains(self: *const NetRestrict, addr: std.net.Address) bool {
         for (self.allowed_networks.items) |network| {
-            if (std.mem.eql(u8, &network.in.sa.addr, &addr.in.sa.addr)) {
+            if (network.in.sa.addr == addr.in.sa.addr) {
                 return true;
             }
         }
@@ -205,8 +205,8 @@ pub const DialScheduler = struct {
             self.allocator.destroy(task.*);
         }
         self.static_tasks.deinit();
-        self.static_pool.deinit();
-        self.history.deinit();
+        self.static_pool.deinit(self.allocator);
+        self.history.deinit(self.allocator);
 
         self.error_counts.deinit();
         self.allocator.destroy(self);
@@ -291,7 +291,7 @@ pub const DialScheduler = struct {
             self.expireHistory();
 
             // Small sleep to prevent busy loop
-            std.time.sleep(100 * std.time.ns_per_ms);
+            std.Thread.sleep(100 * std.time.ns_per_ms);
         }
     }
 
@@ -514,7 +514,7 @@ pub const DialScheduler = struct {
         std.log.debug("Starting dial to node", .{});
 
         const now = std.time.timestamp();
-        try self.history.append(.{
+        try self.history.append(self.allocator, .{
             .node_id = task.dest.id,
             .expires_at = now + DIAL_HISTORY_EXPIRATION,
         });
@@ -562,7 +562,7 @@ pub const DialScheduler = struct {
         if (task.static_pool_index >= 0) {
             return; // Already in pool
         }
-        try self.static_pool.append(task);
+        try self.static_pool.append(self.allocator, task);
         task.static_pool_index = @intCast(self.static_pool.items.len - 1);
     }
 
@@ -660,7 +660,7 @@ pub const DialScheduler = struct {
     }
 
     /// Read nodes from iterator
-    fn readNodesLoop(self: *Self, iterator: NodeIterator) !void {
+    fn readNodesLoop(self: *Self, iterator: *NodeIterator) !void {
         while (self.running.load(.monotonic)) {
             if (iterator.next()) |node| {
                 self.nodes_in_ch.send(node) catch |err| {

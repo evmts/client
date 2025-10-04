@@ -155,7 +155,7 @@ pub fn main() !void {
 threadlocal var shutdown_flag: ?*std.atomic.Value(bool) = null;
 
 /// Signal handler for SIGINT and SIGTERM
-fn handleSignal(sig: c_int) callconv(.C) void {
+fn handleSignal(sig: c_int) callconv(.c) void {
     _ = sig;
     if (shutdown_flag) |flag| {
         flag.store(true, .release);

@@ -16,6 +16,7 @@ const std = @import("std");
 const kv = @import("../kv/kv.zig");
 const tables = @import("../kv/tables.zig");
 const InvertedIndex = @import("inverted_index.zig").InvertedIndex;
+const Decompressor = @import("../kv/decompressor.zig").Decompressor;
 
 /// History configuration
 pub const HistoryConfig = struct {
@@ -103,26 +104,53 @@ pub const History = struct {
     /// Returns the value that was active at tx_num
     ///
     /// Algorithm (from history.go HistorySeek):
-    /// 1. Use inverted index to find txNums where key changed
-    /// 2. Binary search for largest txNum <= target
-    /// 3. Read value from .v file or DB
+    /// 1. Try to find in files first (faster)
+    /// 2. Use inverted index to find txNums where key changed
+    /// 3. Read value from .v file using .vi index
+    /// 4. Fallback to DB scan if not in files
     pub fn seekValue(self: *Self, key: []const u8, tx_num: u64, db_tx: *kv.Transaction) !?[]const u8 {
-        // First try inverted index to find relevant transaction numbers
-        if (self.inverted_index) |idx| {
-            const tx_nums = try idx.seek(key, tx_num, db_tx);
-            defer self.allocator.free(tx_nums);
-
-            if (tx_nums.len > 0) {
-                // Find the most recent txNum <= our target
-                const target_tx = self.findMostRecentTx(tx_nums, tx_num);
-                if (target_tx) |tx| {
-                    return try self.getValue(key, tx, db_tx);
-                }
-            }
+        // First try to find in files (like historySeekInFiles)
+        if (try self.seekInFiles(key, tx_num)) |value| {
+            return value;
         }
 
         // Fallback: scan history table directly
         return try self.scanHistory(key, tx_num, db_tx);
+    }
+
+    /// Seek value in history files
+    /// Algorithm (from history.go historySeekInFiles):
+    /// 1. Use inverted index to find which txNum has the value
+    /// 2. Find which file contains that txNum
+    /// 3. Use .vi index to find offset in .v file
+    /// 4. Read and decompress value
+    fn seekInFiles(self: *Self, key: []const u8, tx_num: u64) !?[]const u8 {
+        // Use inverted index to find the transaction number
+        if (self.inverted_index) |idx| {
+            const hist_tx_num = try idx.seekTxNum(key, tx_num);
+            if (hist_tx_num == null) return null;
+
+            // Find file containing this txNum
+            const file = self.findFileForTx(hist_tx_num.?) orelse return null;
+
+            // Read value from file
+            return try file.get(key, hist_tx_num.?);
+        }
+
+        return null;
+    }
+
+    /// Find file that contains given transaction number
+    fn findFileForTx(self: *Self, tx_num: u64) ?*HistoryFile {
+        for (self.files.items) |*file| {
+            const from_tx = file.from_step * self.step_size;
+            const to_tx = file.to_step * self.step_size;
+
+            if (tx_num >= from_tx and tx_num < to_tx) {
+                return file;
+            }
+        }
+        return null;
     }
 
     /// Get value for key at specific transaction number
@@ -240,29 +268,79 @@ pub const HistoryFile = struct {
     /// Path to .vi file (value index)
     vi_path: ?[]const u8 = null,
 
+    /// Decompressor for .v file (lazy-loaded)
+    decompressor: ?*Decompressor = null,
+
+    /// Index for .vi file (lazy-loaded)
+    /// TODO: Implement index reader
+    index: ?*anyopaque = null,
+
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, from: u64, to: u64, base_path: []const u8) !HistoryFile {
         const v_path = try std.fmt.allocPrint(allocator, "{s}.{d}-{d}.v", .{ base_path, from, to });
+        const vi_path = try std.fmt.allocPrint(allocator, "{s}.{d}-{d}.vi", .{ base_path, from, to });
+
         return HistoryFile{
             .allocator = allocator,
             .from_step = from,
             .to_step = to,
             .v_path = v_path,
+            .vi_path = vi_path,
         };
     }
 
     pub fn deinit(self: *HistoryFile) void {
+        if (self.decompressor) |decomp| {
+            decomp.close();
+        }
         self.allocator.free(self.v_path);
         if (self.vi_path) |p| self.allocator.free(p);
     }
 
     /// Get value for key at transaction number from this file
+    /// Algorithm (from history.go historySeekInFiles):
+    /// 1. Build history key: txNum (8 bytes) ++ key
+    /// 2. Use .vi index to find offset in .v file
+    /// 3. Use decompressor to read value at offset
+    /// 4. Return decompressed value
     pub fn get(self: *HistoryFile, key: []const u8, tx_num: u64) !?[]const u8 {
-        _ = self;
-        _ = key;
-        _ = tx_num;
-        // TODO: Implement file reading
+        // Lazy-load decompressor if needed
+        if (self.decompressor == null) {
+            self.decompressor = try Decompressor.open(self.allocator, self.v_path);
+        }
+
+        const decomp = self.decompressor.?;
+
+        // Build history key: txNum (8 bytes, big-endian) ++ key
+        var history_key = try self.allocator.alloc(u8, 8 + key.len);
+        defer self.allocator.free(history_key);
+
+        std.mem.writeInt(u64, history_key[0..8], tx_num, .big);
+        @memcpy(history_key[8..], key);
+
+        // TODO: Use .vi index to find offset
+        // For now, scan through decompressor (slow but works)
+        var getter = decomp.makeGetter();
+
+        while (getter.hasNext()) {
+            const word = try getter.next(self.allocator);
+            defer self.allocator.free(word);
+
+            // Parse word format: key ++ value
+            // For history: txNum+key → value
+            // We need to check if this word matches our search key
+
+            // This is simplified - in production we'd use the .vi index
+            // to jump directly to the right offset
+            if (word.len >= history_key.len) {
+                if (std.mem.eql(u8, word[0..history_key.len], history_key)) {
+                    // Found it - return the value part
+                    return try self.allocator.dupe(u8, word[history_key.len..]);
+                }
+            }
+        }
+
         return null;
     }
 };

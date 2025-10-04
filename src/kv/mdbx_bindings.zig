@@ -174,3 +174,45 @@ pub fn valFromSlice(slice: []const u8) Val {
 pub fn sliceFromVal(val: Val) []const u8 {
     return @as([*]const u8, @ptrCast(val.iov_base))[0..val.iov_len];
 }
+
+// Statistics and info functions
+pub const env_info = c.mdbx_env_info;
+pub const env_stat = c.mdbx_env_stat;
+pub const txn_info = c.mdbx_txn_info;
+
+// Additional cursor operations
+pub const NEXT_DUP = c.MDBX_NEXT_DUP;
+pub const NEXT_NODUP = c.MDBX_NEXT_NODUP;
+pub const PREV_DUP = c.MDBX_PREV_DUP;
+pub const PREV_NODUP = c.MDBX_PREV_NODUP;
+pub const FIRST_DUP = c.MDBX_FIRST_DUP;
+pub const LAST_DUP = c.MDBX_LAST_DUP;
+pub const GET_BOTH = c.MDBX_GET_BOTH;
+pub const GET_BOTH_RANGE = c.MDBX_GET_BOTH_RANGE;
+
+// Put flags
+pub const PutFlags = struct {
+    pub const UPSERT = @as(c_uint, 0);
+    pub const NOOVERWRITE = c.MDBX_NOOVERWRITE;
+    pub const NODUPDATA = c.MDBX_NODUPDATA;
+    pub const CURRENT = c.MDBX_CURRENT;
+    pub const ALLDUPS = c.MDBX_ALLDUPS;
+    pub const RESERVE = c.MDBX_RESERVE;
+    pub const APPEND = c.MDBX_APPEND;
+    pub const APPENDDUP = c.MDBX_APPENDDUP;
+    pub const MULTIPLE = c.MDBX_MULTIPLE;
+};
+
+// Environment geometry
+pub fn setGeometry(env: *Env, size_lower: i64, size_now: i64, size_upper: i64, growth_step: i64, shrink_threshold: i64, pagesize: i64) Error!void {
+    const rc = c.mdbx_env_set_geometry(env, size_lower, size_now, size_upper, growth_step, shrink_threshold, pagesize);
+    try checkError(rc);
+}
+
+// Database comparison functions
+pub const cmp = c.mdbx_cmp;
+pub const dcmp = c.mdbx_dcmp;
+
+// Reader list functions
+pub const reader_list = c.mdbx_reader_list;
+pub const reader_check = c.mdbx_reader_check;

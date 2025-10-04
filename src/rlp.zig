@@ -12,6 +12,11 @@ pub const RlpError = error{
     IntegerOverflow,
     NegativeInteger,
     OutOfMemory,
+    CanonicalIntError,
+    CanonicalSizeError,
+    ElemTooLarge,
+    ValueTooLarge,
+    MoreThanOneValue,
 };
 
 // RLP encoding constants
@@ -307,6 +312,24 @@ pub const Decoder = struct {
     pub fn isEmpty(self: *const Decoder) bool {
         return self.pos >= self.data.len;
     }
+
+    /// Validate canonical encoding (no leading zeros in integers)
+    pub fn validateCanonicalInt(bytes: []const u8) !void {
+        if (bytes.len > 1 and bytes[0] == 0) {
+            return error.CanonicalIntError;
+        }
+    }
+
+    /// Check if more data exists after current position
+    pub fn hasMoreData(self: *const Decoder) bool {
+        return self.pos < self.data.len;
+    }
+
+    /// Get remaining bytes
+    pub fn remaining(self: *const Decoder) []const u8 {
+        if (self.pos >= self.data.len) return &[_]u8{};
+        return self.data[self.pos..];
+    }
 };
 
 fn decodeLengthBytes(bytes: []const u8) !usize {
@@ -318,6 +341,88 @@ fn decodeLengthBytes(bytes: []const u8) !usize {
     }
     return result;
 }
+
+/// RLP Encoder with buffer pooling (similar to Erigon's encBuffer)
+pub const Encoder = struct {
+    buffer: std.ArrayList(u8),
+    list_stack: std.ArrayList(usize), // Track list start positions
+
+    pub fn init(allocator: std.mem.Allocator) Encoder {
+        return .{
+            .buffer = std.ArrayList(u8).init(allocator),
+            .list_stack = std.ArrayList(usize).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *Encoder) void {
+        self.buffer.deinit();
+        self.list_stack.deinit();
+    }
+
+    pub fn reset(self: *Encoder) void {
+        self.buffer.clearRetainingCapacity();
+        self.list_stack.clearRetainingCapacity();
+    }
+
+    /// Start encoding a list
+    pub fn startList(self: *Encoder) !void {
+        try self.list_stack.append(self.buffer.items.len);
+    }
+
+    /// Finish encoding current list
+    pub fn endList(self: *Encoder) !void {
+        if (self.list_stack.items.len == 0) return error.InvalidRlpData;
+
+        const list_start = self.list_stack.pop();
+        const payload_len = self.buffer.items.len - list_start;
+
+        // Encode list header
+        var header: [9]u8 = undefined;
+        const header_len = encodeListHeader(&header, payload_len);
+
+        // Insert header at list start
+        try self.buffer.insertSlice(list_start, header[0..header_len]);
+    }
+
+    /// Write bytes to encoder
+    pub fn writeBytes(self: *Encoder, data: []const u8) !void {
+        try encodeBytesTo(&self.buffer, data);
+    }
+
+    /// Write integer to encoder
+    pub fn writeInt(self: *Encoder, value: u64) !void {
+        try encodeIntTo(&self.buffer, value);
+    }
+
+    /// Get encoded result
+    pub fn toOwnedSlice(self: *Encoder) ![]u8 {
+        return self.buffer.toOwnedSlice();
+    }
+
+    pub fn toSlice(self: *const Encoder) []const u8 {
+        return self.buffer.items;
+    }
+
+    fn encodeListHeader(buf: []u8, payload_len: usize) usize {
+        if (payload_len <= 55) {
+            buf[0] = EMPTY_LIST_CODE + @as(u8, @intCast(payload_len));
+            return 1;
+        }
+
+        // Encode length of length
+        const len_bytes = encodeLengthBytes(payload_len);
+        var len_of_len: usize = 0;
+        for (len_bytes) |b| {
+            if (b != 0 or len_of_len > 0) {
+                len_of_len += 1;
+            }
+        }
+
+        buf[0] = 0xf7 + @as(u8, @intCast(len_of_len));
+        @memcpy(buf[1..1+len_of_len], len_bytes[8-len_of_len..8]);
+        return 1 + len_of_len;
+    }
+};
 
 // Tests
 test "encode single byte" {

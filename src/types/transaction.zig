@@ -16,18 +16,18 @@ pub const Authorization = common_mod.Authorization;
 pub const CommonTx = common_mod.CommonTx;
 
 const LegacyTx = @import("legacy.zig").LegacyTx;
+const AccessListTx = @import("access_list.zig").AccessListTx;
+const DynamicFeeTx = @import("dynamic_fee.zig").DynamicFeeTx;
 // TODO: Import other transaction types as they're implemented
-// const AccessListTx = @import("access_list.zig").AccessListTx;
-// const DynamicFeeTx = @import("dynamic_fee.zig").DynamicFeeTx;
 // const BlobTx = @import("blob.zig").BlobTx;
 // const SetCodeTx = @import("set_code.zig").SetCodeTx;
 
 /// Main transaction type (tagged union)
 pub const Transaction = union(TxType) {
     legacy: LegacyTx,
+    access_list: AccessListTx,
+    dynamic_fee: DynamicFeeTx,
     // TODO: Add other transaction types
-    // access_list: AccessListTx,
-    // dynamic_fee: DynamicFeeTx,
     // blob: BlobTx,
     // set_code: SetCodeTx,
     // account_abstraction: AATx,
@@ -36,8 +36,8 @@ pub const Transaction = union(TxType) {
     pub fn txType(self: Transaction) u8 {
         return switch (self) {
             .legacy => 0,
-            // .access_list => 1,
-            // .dynamic_fee => 2,
+            .access_list => 1,
+            .dynamic_fee => 2,
             // .blob => 3,
             // .set_code => 4,
             // .account_abstraction => 5,
@@ -62,8 +62,8 @@ pub const Transaction = union(TxType) {
     pub fn getGasPrice(self: Transaction) ?U256 {
         return switch (self) {
             .legacy => |tx| tx.getGasPrice(),
-            // .access_list => |tx| tx.getGasPrice(),
-            // else => null,
+            .access_list => |tx| tx.getGasPrice(),
+            .dynamic_fee => |tx| tx.getGasPrice(),
         };
     }
 
@@ -149,7 +149,7 @@ pub const Transaction = union(TxType) {
         return switch (self) {
             .legacy => |tx| tx.isProtected(),
             // All typed transactions are protected by default
-            // else => true,
+            .access_list, .dynamic_fee => true,
         };
     }
 
@@ -157,8 +157,8 @@ pub const Transaction = union(TxType) {
     pub fn getChainId(self: Transaction) ?U256 {
         return switch (self) {
             .legacy => |tx| tx.getChainId(),
-            // .access_list => |tx| tx.chain_id,
-            // .dynamic_fee => |tx| tx.chain_id,
+            .access_list => |tx| tx.chain_id,
+            .dynamic_fee => |tx| tx.chain_id,
             // .blob => |tx| tx.chain_id,
             // .set_code => |tx| tx.chain_id,
             // .account_abstraction => null,
@@ -176,8 +176,8 @@ pub const Transaction = union(TxType) {
     pub fn getSender(self: Transaction) ?Address {
         return switch (self) {
             .legacy => |tx| tx.common.getSender(),
-            // .access_list => |tx| tx.common.getSender(),
-            // .dynamic_fee => |tx| tx.common.getSender(),
+            .access_list => |tx| tx.legacy.common.getSender(),
+            .dynamic_fee => |tx| tx.common.getSender(),
             // .blob => |tx| tx.common.getSender(),
             // .set_code => |tx| tx.common.getSender(),
             // .account_abstraction => null,
@@ -188,8 +188,8 @@ pub const Transaction = union(TxType) {
     pub fn setSender(self: *Transaction, sender: Address) void {
         switch (self.*) {
             .legacy => |*tx| tx.common.setSender(sender),
-            // .access_list => |*tx| tx.common.setSender(sender),
-            // .dynamic_fee => |*tx| tx.common.setSender(sender),
+            .access_list => |*tx| tx.legacy.common.setSender(sender),
+            .dynamic_fee => |*tx| tx.common.setSender(sender),
             // .blob => |*tx| tx.common.setSender(sender),
             // .set_code => |*tx| tx.common.setSender(sender),
             // .account_abstraction => {},
@@ -200,7 +200,8 @@ pub const Transaction = union(TxType) {
     pub fn hash(self: *Transaction, allocator: std.mem.Allocator) !Hash {
         return switch (self.*) {
             .legacy => |*tx| try tx.hash(allocator),
-            // TODO: Implement for other types
+            .access_list => |*tx| try tx.hash(allocator),
+            .dynamic_fee => |*tx| try tx.hash(allocator),
         };
     }
 
@@ -208,7 +209,14 @@ pub const Transaction = union(TxType) {
     pub fn signingHash(self: Transaction, allocator: std.mem.Allocator, chain_id: ?U256) !Hash {
         return switch (self) {
             .legacy => |tx| try tx.signingHash(allocator, chain_id),
-            // TODO: Implement for other types
+            .access_list => |tx| {
+                _ = chain_id; // access_list has its own chain_id
+                return try tx.signingHash(allocator);
+            },
+            .dynamic_fee => |tx| {
+                _ = chain_id; // dynamic_fee has its own chain_id
+                return try tx.signingHash(allocator);
+            },
         };
     }
 
@@ -216,7 +224,8 @@ pub const Transaction = union(TxType) {
     pub fn clone(self: Transaction, allocator: std.mem.Allocator) !Transaction {
         return switch (self) {
             .legacy => |tx| .{ .legacy = try tx.clone(allocator) },
-            // TODO: Implement for other types
+            .access_list => |tx| .{ .access_list = try tx.clone(allocator) },
+            .dynamic_fee => |tx| .{ .dynamic_fee = try tx.clone(allocator) },
         };
     }
 
@@ -224,7 +233,8 @@ pub const Transaction = union(TxType) {
     pub fn deinit(self: *Transaction, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .legacy => |*tx| tx.deinit(allocator),
-            // TODO: Implement for other types
+            .access_list => |*tx| tx.deinit(allocator),
+            .dynamic_fee => |*tx| tx.deinit(allocator),
         }
     }
 
@@ -253,7 +263,8 @@ pub const Transaction = union(TxType) {
     pub fn encode(self: Transaction, allocator: std.mem.Allocator) ![]u8 {
         return switch (self) {
             .legacy => |tx| try tx.encodeRlp(allocator),
-            // TODO: Implement for other types
+            .access_list => |tx| try tx.encode(allocator),
+            .dynamic_fee => |tx| try tx.encode(allocator),
         };
     }
 };

@@ -74,7 +74,7 @@ pub const MemDb = struct {
             .writable = writable,
             .allocator = self.allocator,
             .tx_interface = .{
-                .vtable = &tx_vtable,
+                .vtable = &MemTx.tx_vtable,
                 .ptr = tx,
             },
         };
@@ -154,7 +154,7 @@ const MemTx = struct {
             .current_index = null,
             .allocator = self.allocator,
             .cursor_interface = .{
-                .vtable = &cursor_vtable,
+                .vtable = &MemCursor.cursor_vtable,
                 .ptr = cursor,
             },
         };

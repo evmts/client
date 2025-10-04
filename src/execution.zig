@@ -346,7 +346,7 @@ pub const StateTransition = struct {
     }
 
     /// Execute the transaction
-    pub fn transitionDb(self: *StateTransition, refunds: bool, gas_bailout: bool) !ExecutionResult {
+    pub fn transitionDb(self: *StateTransition, _: bool, _: bool) !ExecutionResult {
         // Snapshot state for rollback
         const snapshot = self.ibs.snapshot();
         errdefer self.ibs.revertToSnapshot(snapshot);

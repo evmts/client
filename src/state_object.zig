@@ -30,7 +30,7 @@ pub const StateObject = struct {
     original: database.Account,
 
     /// Contract bytecode (lazy loaded)
-    code: ?[]const u8,
+    code_data: ?[]const u8,
 
     /// Storage caching - 3-tier system for correct gas calculation
     ///
@@ -70,7 +70,7 @@ pub const StateObject = struct {
             .address = address,
             .data = data,
             .original = data,
-            .code = null,
+            .code_data = null,
             .origin_storage = Storage.init(allocator),
             .block_origin_storage = Storage.init(allocator),
             .dirty_storage = Storage.init(allocator),
@@ -100,8 +100,8 @@ pub const StateObject = struct {
         if (self.fake_storage) |*fake| {
             fake.deinit();
         }
-        if (self.code) |code| {
-            self.allocator.free(code);
+        if (self.code_data) |code_bytes| {
+            self.allocator.free(code_bytes);
         }
     }
 
@@ -184,7 +184,7 @@ pub const StateObject = struct {
     /// Get contract code (lazy loads from database)
     pub fn code(self: *Self) ![]const u8 {
         // If already loaded, return it
-        if (self.code) |c| {
+        if (self.code_data) |c| {
             return c;
         }
 
@@ -203,10 +203,10 @@ pub const StateObject = struct {
     pub fn setCode(self: *Self, code_hash: [32]u8, new_code: []const u8) !void {
         // Store code copy
         const code_copy = try self.allocator.dupe(u8, new_code);
-        if (self.code) |old_code| {
+        if (self.code_data) |old_code| {
             self.allocator.free(old_code);
         }
-        self.code = code_copy;
+        self.code_data = code_copy;
         self.data.code_hash = code_hash;
         self.dirty_code = true;
     }
@@ -222,8 +222,8 @@ pub const StateObject = struct {
     }
 
     /// Set incarnation (for contract recreation)
-    pub fn setIncarnation(self: *Self, incarnation: u64) void {
-        self.data.incarnation = incarnation;
+    pub fn setIncarnation(self: *Self, new_incarnation: u64) void {
+        self.data.incarnation = new_incarnation;
     }
 
     /// Get incarnation
@@ -304,7 +304,7 @@ pub const StateObject = struct {
             .address = self.address,
             .data = self.data,
             .original = self.original,
-            .code = null,
+            .code_data = null,
             .origin_storage = Storage.init(self.allocator),
             .block_origin_storage = Storage.init(self.allocator),
             .dirty_storage = Storage.init(self.allocator),
@@ -317,8 +317,8 @@ pub const StateObject = struct {
         };
 
         // Copy code if present
-        if (self.code) |c| {
-            copy.code = try self.allocator.dupe(u8, c);
+        if (self.code_data) |c| {
+            copy.code_data = try self.allocator.dupe(u8, c);
         }
 
         // Copy storage maps

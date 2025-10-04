@@ -97,7 +97,7 @@ pub const PatternTable = struct {
         if (self.bit_len <= CONDENSE_TABLE_BIT_THRESHOLD) {
             // Direct indexing for small tables
             const code_step: u16 = @as(u16, 1) << @intCast(cw.len);
-            var code_from = cw.code;
+            const code_from = cw.code;
             const code_to = if (self.bit_len != cw.len and cw.len > 0)
                 code_from | (@as(u16, 1) << @intCast(self.bit_len))
             else

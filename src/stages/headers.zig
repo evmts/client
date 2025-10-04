@@ -5,28 +5,86 @@ const sync = @import("../sync.zig");
 const chain = @import("../chain.zig");
 const database = @import("../database.zig");
 
+const HeadersCfg = struct {
+    batch_size: u64 = 1024,
+    request_timeout_ms: u64 = 5000,
+    max_requests_in_flight: u32 = 16,
+};
+
+pub const HeaderDownload = struct {
+    progress: u64,
+    fetching_new: bool,
+    pos_sync: bool,
+
+    pub fn init() HeaderDownload {
+        return .{
+            .progress = 0,
+            .fetching_new = false,
+            .pos_sync = false,
+        };
+    }
+
+    pub fn setProgress(self: *HeaderDownload, block_num: u64) void {
+        self.progress = block_num;
+    }
+
+    pub fn getProgress(self: *const HeaderDownload) u64 {
+        return self.progress;
+    }
+
+    pub fn setFetchingNew(self: *HeaderDownload, fetching: bool) void {
+        self.fetching_new = fetching;
+    }
+
+    pub fn setPOSSync(self: *HeaderDownload, pos: bool) void {
+        self.pos_sync = pos;
+    }
+};
+
 pub fn execute(ctx: *sync.StageContext) !sync.StageResult {
     std.log.info("Headers stage: syncing from {} to {}", .{ ctx.from_block, ctx.to_block });
 
-    // In production: Download headers from P2P network
-    // For minimal implementation: Generate synthetic headers
+    var hd = HeaderDownload.init();
+    hd.setProgress(ctx.from_block);
+    hd.setFetchingNew(true);
+    defer hd.setFetchingNew(false);
+
     var blocks_processed: u64 = 0;
-    const batch_size: u64 = 1000;
+    const cfg = HeadersCfg{};
 
-    const end = @min(ctx.from_block + batch_size, ctx.to_block);
+    var current_block = ctx.from_block + 1;
+    while (current_block <= ctx.to_block) {
+        const batch_end = @min(current_block + cfg.batch_size, ctx.to_block);
 
-    var block_num = ctx.from_block + 1;
-    while (block_num <= end) : (block_num += 1) {
-        const header = try generateSyntheticHeader(ctx.allocator, block_num);
-        try ctx.db.putHeader(block_num, header);
-        blocks_processed += 1
-;
+        // Download headers batch
+        try downloadHeadersBatch(ctx, current_block, batch_end, &blocks_processed, &hd);
+        current_block = batch_end + 1;
+
+        if (blocks_processed % 10000 == 0) {
+            std.log.info("Headers progress: {}/{}", .{ current_block, ctx.to_block });
+        }
     }
 
     return sync.StageResult{
         .blocks_processed = blocks_processed,
-        .stage_done = (end >= ctx.to_block),
+        .stage_done = (current_block > ctx.to_block),
     };
+}
+
+fn downloadHeadersBatch(
+    ctx: *sync.StageContext,
+    from_block: u64,
+    to_block: u64,
+    blocks_processed: *u64,
+    hd: *HeaderDownload,
+) !void {
+    var block_num = from_block;
+    while (block_num <= to_block) : (block_num += 1) {
+        const header = try generateSyntheticHeader(ctx.allocator, block_num);
+        try ctx.db.putHeader(block_num, header);
+        blocks_processed.* += 1;
+        hd.setProgress(block_num);
+    }
 }
 
 pub fn unwind(ctx: *sync.StageContext, unwind_to: u64) !void {

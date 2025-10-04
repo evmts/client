@@ -1,10 +1,12 @@
 //! State management layer
 //! Provides EVM-compatible state access with journaling for reverts
+//! Based on Erigon's core/state/intra_block_state.go
 
 const std = @import("std");
 const primitives = @import("primitives");
 const Address = primitives.Address;
 const database = @import("database.zig");
+const AccessList = @import("access_list.zig").AccessList;
 
 // Import U256 from chain module
 const U256 = @import("chain.zig").U256;
@@ -13,6 +15,7 @@ pub const StateError = error{
     OutOfMemory,
     AccountNotFound,
     StorageNotFound,
+    InsufficientBalance,
 };
 
 /// Journal entry for reverting state changes
@@ -30,16 +33,44 @@ const JournalEntry = union(enum) {
         address: [20]u8,
         previous_hash: [32]u8,
     },
+    /// Access list address added (for rollback)
+    access_list_address: struct {
+        address: Address,
+    },
+    /// Access list slot added (for rollback)
+    access_list_slot: struct {
+        address: Address,
+        slot: [32]u8,
+    },
+    /// Refund change
+    refund_change: struct {
+        previous: u64,
+    },
+    /// Balance increase (optimized path without reading account first)
+    balance_increase: struct {
+        address: Address,
+        amount: u256,
+    },
 };
 
-/// State provider with journaling for transaction execution
-pub const State = struct {
+/// IntraBlockState - state changes during block execution
+/// Based on Erigon's IntraBlockState
+pub const IntraBlockState = struct {
     allocator: std.mem.Allocator,
     db: *database.Database,
     accounts: std.AutoHashMap([20]u8, database.Account),
     storage: std.AutoHashMap(StorageKey, [32]u8),
     journal: std.ArrayList(JournalEntry),
     checkpoint: usize,
+
+    /// Per-transaction access list (EIP-2929)
+    access_list: AccessList,
+
+    /// Refund counter
+    refund: u64,
+
+    /// Transaction index
+    tx_index: usize,
 
     const StorageKey = struct {
         address: [20]u8,
@@ -58,7 +89,7 @@ pub const State = struct {
         }
     };
 
-    pub fn init(allocator: std.mem.Allocator, db: *database.Database) State {
+    pub fn init(allocator: std.mem.Allocator, db: *database.Database) IntraBlockState {
         return .{
             .allocator = allocator,
             .db = db,
@@ -66,27 +97,31 @@ pub const State = struct {
             .storage = std.AutoHashMap(StorageKey, [32]u8).init(allocator),
             .journal = std.ArrayList(JournalEntry).empty,
             .checkpoint = 0,
+            .access_list = AccessList.init(allocator),
+            .refund = 0,
+            .tx_index = 0,
         };
     }
 
-    pub fn deinit(self: *State) void {
+    pub fn deinit(self: *IntraBlockState) void {
         self.accounts.deinit();
         self.storage.deinit();
         self.journal.deinit(self.allocator);
+        self.access_list.deinit();
     }
 
     /// Create a checkpoint for potential rollback
-    pub fn createCheckpoint(self: *State) void {
+    pub fn createCheckpoint(self: *IntraBlockState) void {
         self.checkpoint = self.journal.items.len;
     }
 
     /// Commit changes since last checkpoint
-    pub fn commitCheckpoint(self: *State) void {
+    pub fn commitCheckpoint(self: *IntraBlockState) void {
         self.checkpoint = self.journal.items.len;
     }
 
     /// Revert to last checkpoint
-    pub fn revertToCheckpoint(self: *State) !void {
+    pub fn revertToCheckpoint(self: *IntraBlockState) !void {
         while (self.journal.items.len > self.checkpoint) {
             const entry = self.journal.pop();
             switch (entry) {
@@ -114,7 +149,7 @@ pub const State = struct {
     }
 
     /// Get account, loading from database if needed
-    pub fn getAccount(self: *State, address: Address) !database.Account {
+    pub fn getAccount(self: *IntraBlockState, address: Address) !database.Account {
         const addr_bytes = address.bytes;
 
         // Check cache first
@@ -129,7 +164,7 @@ pub const State = struct {
     }
 
     /// Update account state
-    pub fn setAccount(self: *State, address: Address, account: database.Account) !void {
+    pub fn setAccount(self: *IntraBlockState, address: Address, account: database.Account) !void {
         const addr_bytes = address.bytes;
 
         // Record previous state in journal
@@ -145,7 +180,7 @@ pub const State = struct {
     }
 
     /// Get storage slot
-    pub fn getStorage(self: *State, address: Address, slot: U256) ![32]u8 {
+    pub fn getStorage(self: *IntraBlockState, address: Address, slot: U256) ![32]u8 {
         const key = StorageKey{
             .address = address.bytes,
             .slot = slot.toBytes(),
@@ -162,7 +197,7 @@ pub const State = struct {
     }
 
     /// Set storage slot
-    pub fn setStorage(self: *State, address: Address, slot: U256, value: U256) !void {
+    pub fn setStorage(self: *IntraBlockState, address: Address, slot: U256, value: U256) !void {
         const key = StorageKey{
             .address = address.bytes,
             .slot = slot.toBytes(),
@@ -181,33 +216,33 @@ pub const State = struct {
     }
 
     /// Get account balance
-    pub fn getBalance(self: *State, address: Address) !U256 {
+    pub fn getBalance(self: *IntraBlockState, address: Address) !U256 {
         const account = try self.getAccount(address);
         return U256.fromBytes(account.balance);
     }
 
     /// Set account balance
-    pub fn setBalance(self: *State, address: Address, balance: U256) !void {
+    pub fn setBalance(self: *IntraBlockState, address: Address, balance: U256) !void {
         var account = try self.getAccount(address);
         account.balance = balance.toBytes();
         try self.setAccount(address, account);
     }
 
     /// Get account nonce
-    pub fn getNonce(self: *State, address: Address) !u64 {
+    pub fn getNonce(self: *IntraBlockState, address: Address) !u64 {
         const account = try self.getAccount(address);
         return account.nonce;
     }
 
     /// Set account nonce
-    pub fn setNonce(self: *State, address: Address, nonce: u64) !void {
+    pub fn setNonce(self: *IntraBlockState, address: Address, nonce: u64) !void {
         var account = try self.getAccount(address);
         account.nonce = nonce;
         try self.setAccount(address, account);
     }
 
     /// Get contract code
-    pub fn getCode(self: *State, address: Address) ![]const u8 {
+    pub fn getCode(self: *IntraBlockState, address: Address) ![]const u8 {
         const account = try self.getAccount(address);
         if (std.mem.eql(u8, &account.code_hash, &([_]u8{0} ** 32))) {
             return &[_]u8{};
@@ -216,7 +251,7 @@ pub const State = struct {
     }
 
     /// Set contract code
-    pub fn setCode(self: *State, address: Address, code: []const u8) !void {
+    pub fn setCode(self: *IntraBlockState, address: Address, code: []const u8) !void {
         const code_hash = std.crypto.hash.sha3.Keccak256.hash(code, .{});
 
         var account = try self.getAccount(address);
@@ -238,7 +273,7 @@ pub const State = struct {
     }
 
     /// Check if account exists
-    pub fn exists(self: *State, address: Address) !bool {
+    pub fn exists(self: *IntraBlockState, address: Address) !bool {
         const account = try self.getAccount(address);
         return account.nonce != 0 or
             !std.mem.eql(u8, &account.balance, &([_]u8{0} ** 32)) or
@@ -246,7 +281,7 @@ pub const State = struct {
     }
 
     /// Commit all changes to database
-    pub fn commitToDb(self: *State) !void {
+    pub fn commitToDb(self: *IntraBlockState) !void {
         // Write all accounts to database
         var account_iter = self.accounts.iterator();
         while (account_iter.next()) |entry| {
@@ -259,11 +294,14 @@ pub const State = struct {
     }
 };
 
+/// Legacy alias for backwards compatibility
+pub const State = IntraBlockState;
+
 test "state account operations" {
     var db = database.Database.init(std.testing.allocator);
     defer db.deinit();
 
-    var state = State.init(std.testing.allocator, &db);
+    var state = IntraBlockState.init(std.testing.allocator, &db);
     defer state.deinit();
 
     const addr = primitives.Address.fromBytes([_]u8{1} ++ [_]u8{0} ** 19);
@@ -278,7 +316,7 @@ test "state journaling and revert" {
     var db = database.Database.init(std.testing.allocator);
     defer db.deinit();
 
-    var state = State.init(std.testing.allocator, &db);
+    var state = IntraBlockState.init(std.testing.allocator, &db);
     defer state.deinit();
 
     const addr = primitives.Address.fromBytes([_]u8{1} ++ [_]u8{0} ** 19);
@@ -299,7 +337,7 @@ test "state storage operations" {
     var db = database.Database.init(std.testing.allocator);
     defer db.deinit();
 
-    var state = State.init(std.testing.allocator, &db);
+    var state = IntraBlockState.init(std.testing.allocator, &db);
     defer state.deinit();
 
     const addr = primitives.Address.fromBytes([_]u8{1} ++ [_]u8{0} ** 19);

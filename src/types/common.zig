@@ -75,12 +75,12 @@ pub const AccessList = struct {
     }
 };
 
-/// Authorization for EIP-7702 set code transactions
+/// Authorization for EIP-7702 (SetCode transactions)
 pub const Authorization = struct {
     chain_id: U256,
     address: Address,
     nonce: u64,
-    v: U256,
+    y_parity: u8, // 0 or 1
     r: U256,
     s: U256,
 

@@ -8,7 +8,7 @@
 
 const std = @import("std");
 const MerkleTrie = @import("merkle_trie.zig").MerkleTrie;
-const rlp = @import("../rlp.zig");
+const rlp = @import("primitives").rlp;
 
 /// Commitment mode
 pub const Mode = enum {

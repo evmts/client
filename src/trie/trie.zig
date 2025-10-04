@@ -1,6 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const rlp = @import("../rlp.zig");
+const rlp = @import("primitives").rlp;
 
 /// Error type for trie operations
 pub const TrieError = error{

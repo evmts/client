@@ -237,24 +237,26 @@ src/kv/decompressor.zig:           700 lines
 STATE_DOMAIN_ARCHITECTURE.md:      600 lines
 DECOMPRESSOR_ARCHITECTURE.md:      600 lines
 src/state/history.zig (enhanced):  +80 lines
+src/state/inverted_index.zig:      +30 lines (seekTxNum)
 PORTING_PROGRESS.md (updated):     +50 lines
-SESSION_3_SUMMARY.md:              +400 lines (this file)
+SESSION_3_SUMMARY.md:              +450 lines (this file)
 ─────────────────────────────────────────────
-Total:                            2,430 lines
+Total:                            2,510 lines
 ```
 
 ### Erigon Code Analyzed
 ```
-db/seg/decompress.go:    1,049 lines
-db/state/history.go:     1,419 lines (partial)
-db/state/domain.go:      2,005 lines (reviewed)
+db/seg/decompress.go:       1,049 lines
+db/state/history.go:        1,419 lines (partial)
+db/state/domain.go:         2,005 lines (reviewed)
+db/state/inverted_index.go:  ~300 lines (partial)
 ─────────────────────────────────────────────
-Total analyzed:          4,473 lines
+Total analyzed:             4,773 lines
 ```
 
 ### Compression Ratio
 ```
-Go analyzed → Zig written:  4,473 → 780 lines = 5.7:1
+Go analyzed → Zig written:  4,773 → 810 lines = 5.9:1
 ```
 
 ---

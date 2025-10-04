@@ -61,10 +61,16 @@ fn generateSyntheticHeader(allocator: std.mem.Allocator, number: u64) !chain.Hea
         .gas_used = 0,
         .timestamp = 1609459200 + (number * 12), // ~12 second blocks
         .extra_data = &[_]u8{},
-        .mix_hash = [_]u8{0} ** 32,
-        .nonce = 0,
-        .base_fee_per_gas = 1000000000, // 1 gwei
+        .mix_digest = [_]u8{0} ** 32,
+        .nonce = chain.encodeNonce(0),
+        .aura_step = null,
+        .aura_seal = null,
+        .base_fee_per_gas = chain.U256.fromInt(1000000000), // 1 gwei
         .withdrawals_root = null,
+        .blob_gas_used = null,
+        .excess_blob_gas = null,
+        .parent_beacon_block_root = null,
+        .requests_hash = null,
     };
 }
 

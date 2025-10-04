@@ -301,7 +301,7 @@ pub const Transaction = struct {
         const v_value = @as(u8, @intCast(self.v.value & 0xFF));
 
         // Recover address from signature
-        const crypto = @import("crypto.zig");
+        const crypto = @import("crypto");
         return crypto.recoverAddress(msg_hash, v_value, self.r.toBytes(), self.s.toBytes());
     }
 
@@ -318,7 +318,7 @@ pub const Transaction = struct {
         // Encode transaction data without signature
         try self.encodeForSigning(allocator, &list);
 
-        const crypto = @import("crypto.zig");
+        const crypto = @import("crypto");
         return crypto.keccak256(list.items);
     }
 

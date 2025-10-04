@@ -40,10 +40,11 @@ pub const Client = struct {
         else
             null;
 
-        const network = if (config.enable_p2p)
-            p2p.NetworkManager.init(allocator, config.node_config.max_peers)
-        else
-            null;
+        const network = if (config.enable_p2p) blk: {
+            // TODO: Get priv_key from config or generate
+            const priv_key = [_]u8{1} ** 32;
+            break :blk try p2p.NetworkManager.init(allocator, config.node_config.max_peers, 30303, priv_key);
+        } else null;
 
         return .{
             .allocator = allocator,
@@ -127,7 +128,6 @@ test "client initialization" {
 // Re-export all modules for testing
 pub const chain = @import("chain.zig");
 pub const database = @import("database.zig");
-pub const state = @import("state.zig");
 pub const sync = @import("sync.zig");
 pub const Node = node_mod.Node;
 pub const stages = struct {

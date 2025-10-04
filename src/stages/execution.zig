@@ -1,109 +1,69 @@
 //! Execution stage: Execute transactions and update state
-//! This is where the EVM is invoked!
+//! This is where guillotine EVM is invoked!
 
 const std = @import("std");
 const sync = @import("../sync.zig");
 const chain = @import("../chain.zig");
 const database = @import("../database.zig");
-const state_mod = @import("../state.zig");
+const guillotine = @import("guillotine_evm");
 const primitives = @import("primitives");
-const U256 = chain.U256;
 
 pub fn execute(ctx: *sync.StageContext) !sync.StageResult {
     std.log.info("Execution stage: processing blocks {} to {}", .{ ctx.from_block, ctx.to_block });
 
-    var state = state_mod.State.init(ctx.allocator, ctx.db);
-    defer state.deinit();
+    // TODO: Initialize guillotine EVM for transaction execution
+    // Example integration:
+    // const evm_config = guillotine.EvmConfig{};
+    // var evm_state = try guillotine.storage.MemoryDatabase.init(ctx.allocator);
+    // var evm = try guillotine.Evm(evm_config).init(ctx.allocator, evm_state, block_context);
 
     var blocks_processed: u64 = 0;
     const batch_size: u64 = 100;
 
-    const end = @min(ctx.from_block + batch_size, ctx.to_block);
-
     var block_num = ctx.from_block + 1;
-    while (block_num <= end) : (block_num += 1) {
-        try executeBlock(ctx, &state, block_num);
+    while (block_num <= ctx.to_block) : (block_num += 1) {
+        try executeBlock(ctx, block_num);
         blocks_processed += 1;
-    }
 
-    // Commit state changes to database
-    try state.commitToDb();
+        // Commit every batch_size blocks
+        if (blocks_processed % batch_size == 0) {
+            try ctx.db.setStageProgress(.execution, block_num);
+        }
+    }
 
     return sync.StageResult{
         .blocks_processed = blocks_processed,
-        .stage_done = (end >= ctx.to_block),
+        .stage_done = (block_num > ctx.to_block),
     };
 }
 
-fn executeBlock(ctx: *sync.StageContext, state: *state_mod.State, block_num: u64) !void {
+fn executeBlock(ctx: *sync.StageContext, block_num: u64) !void {
     const header = ctx.db.getHeader(block_num) orelse return error.HeaderNotFound;
     const body = ctx.db.getBody(block_num) orelse return error.BodyNotFound;
 
-    // Create checkpoint for potential revert
-    state.createCheckpoint();
+    // TODO: Actual EVM execution using guillotine
+    // Integration points:
+    // 1. Create block context from header (block number, timestamp, gas limit, coinbase, etc.)
+    // 2. For each transaction:
+    //    - Build tx context (sender, gas price, etc.)
+    //    - Execute with guillotine EVM
+    //    - Collect receipt (status, gas used, logs)
+    // 3. Calculate state root using guillotine's state management
+    // 4. Verify state root matches header
+    // 5. Store receipts in database
 
-    // Process each transaction
-    for (body.transactions) |tx| {
-        try executeTransaction(ctx, state, &header, &tx);
+    for (body.transactions) |*tx| {
+        _ = tx;
+        // Placeholder for EVM execution
     }
 
-    // Verify state root matches
-    // In production: compute actual state root and compare
-    // For minimal implementation: skip verification
-
-    state.commitCheckpoint();
-}
-
-fn executeTransaction(
-    ctx: *sync.StageContext,
-    state: *state_mod.State,
-    header: *const chain.Header,
-    tx: *const chain.Transaction,
-) !void {
-    _ = ctx;
     _ = header;
-
-    // Get sender
-    const sender = try tx.recoverSender(state.allocator);
-
-    // Check nonce
-    const account_nonce = try state.getNonce(sender);
-    if (account_nonce != tx.nonce) {
-        return error.InvalidNonce;
-    }
-
-    // Deduct gas cost from sender
-    const gas_price = tx.gas_price orelse U256.fromInt(1000000000);
-    const gas_cost = gas_price.mul(U256.fromInt(tx.gas_limit));
-
-    const sender_balance = try state.getBalance(sender);
-    if (sender_balance.lt(gas_cost)) {
-        return error.InsufficientBalance;
-    }
-
-    // Update sender balance and nonce
-    try state.setBalance(sender, sender_balance.sub(gas_cost));
-    try state.setNonce(sender, account_nonce + 1);
-
-    // Execute transaction
-    // In production: Call EVM here
-    // For minimal implementation: Just update state
-
-    if (tx.to) |to_address| {
-        // Transfer to recipient
-        const recipient_balance = try state.getBalance(to_address);
-        try state.setBalance(to_address, recipient_balance.add(tx.value));
-    } else {
-        // Contract creation
-        // In production: Deploy contract via EVM
-        // For minimal implementation: skip
-    }
 }
 
 pub fn unwind(ctx: *sync.StageContext, unwind_to: u64) !void {
     std.log.info("Execution stage: unwinding to block {}", .{unwind_to});
     _ = ctx;
-    // In production: Revert state changes
+    // TODO: Revert state changes using guillotine's rollback mechanism
 }
 
 pub const interface = sync.StageInterface{
@@ -123,7 +83,7 @@ test "execution stage" {
         .state_root = [_]u8{0} ** 32,
         .transactions_root = [_]u8{0} ** 32,
         .receipts_root = [_]u8{0} ** 32,
-        .logs_bloom = [_]u8{0} ** 256,
+        .logs_bloom = [_]u8{0} ** 32 ++ [_]u8{0} ** 32 ++ [_]u8{0} ** 32 ++ [_]u8{0} ** 32 ++ [_]u8{0} ** 32 ++ [_]u8{0} ** 32 ++ [_]u8{0} ** 32 ++ [_]u8{0} ** 32,
         .difficulty = primitives.U256.zero(),
         .number = 1,
         .gas_limit = 30000000,

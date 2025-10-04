@@ -5,8 +5,8 @@ const std = @import("std");
 const sync = @import("../sync.zig");
 const chain = @import("../chain.zig");
 const database = @import("../database.zig");
-const primitives = @import("primitives");
-const rlp = primitives.rlp;
+const primitives = @import("guillotine_primitives");
+const rlp = primitives.Rlp;
 
 /// Bodies stage errors
 pub const BodiesError = error{

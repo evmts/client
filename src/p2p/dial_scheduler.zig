@@ -170,8 +170,8 @@ pub const DialScheduler = struct {
             .dialing = std.AutoHashMap([32]u8, *DialTask).init(config.allocator),
             .peers = std.AutoHashMap([32]u8, ConnFlag).init(config.allocator),
             .static_tasks = std.AutoHashMap([32]u8, *DialTask).init(config.allocator),
-            .static_pool = std.ArrayList(*DialTask).init(config.allocator),
-            .history = std.ArrayList(HistoryEntry).init(config.allocator),
+            .static_pool = std.ArrayList(*DialTask){},
+            .history = std.ArrayList(HistoryEntry){},
             .dial_peers_count = 0,
             .stats_mutex = .{},
             .dialed_count = 0,
@@ -692,13 +692,13 @@ fn Channel(comptime T: type) type {
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{
                 .allocator = allocator,
-                .queue = std.ArrayList(T).init(allocator),
+                .queue = std.ArrayList(T){},
                 .mutex = .{},
             };
         }
 
         pub fn deinit(self: *Self) void {
-            self.queue.deinit();
+            self.queue.deinit(self.allocator);
         }
 
         pub fn send(self: *Self, item: T) !void {

@@ -393,7 +393,7 @@ pub const Server = struct {
 
         // Add bootnodes
         for (self.config.bootnodes) |bootnode| {
-            try self.discovery.?.routing_table.addNode(bootnode);
+            try self.discovery.?.routing_table.addSeenNode(bootnode);
             try self.discovery.?.ping(&bootnode);
         }
 

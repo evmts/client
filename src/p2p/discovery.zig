@@ -77,11 +77,11 @@ pub const Endpoint = struct {
 
         // Encode IP address
         const ip_bytes = switch (self.ip.any.family) {
-            std.os.AF.INET => blk: {
+            std.posix.AF.INET => blk: {
                 const addr = self.ip.in.sa.addr;
                 break :blk std.mem.asBytes(&addr);
             },
-            std.os.AF.INET6 => blk: {
+            std.posix.AF.INET6 => blk: {
                 const addr = self.ip.in6.sa.addr;
                 break :blk std.mem.asBytes(&addr);
             },
@@ -181,11 +181,11 @@ pub const Neighbors = struct {
 
             // Encode IP
             const ip_bytes = switch (node.ip.any.family) {
-                std.os.AF.INET => blk: {
+                std.posix.AF.INET => blk: {
                     const addr = node.ip.in.sa.addr;
                     break :blk std.mem.asBytes(&addr);
                 },
-                std.os.AF.INET6 => blk: {
+                std.posix.AF.INET6 => blk: {
                     const addr = node.ip.in6.sa.addr;
                     break :blk std.mem.asBytes(&addr);
                 },
@@ -634,25 +634,26 @@ pub const UDPv4 = struct {
 
     /// Send a packet
     fn sendPacket(self: *Self, packet_type: PacketType, payload: []const u8, dest: std.net.Address) !void {
-        var packet = std.ArrayList(u8).init(self.allocator);
-        defer packet.deinit();
+        var packet = std.ArrayList(u8){};
+        defer packet.deinit(self.allocator);
 
         // Packet format: hash(32) || signature(65) || packet-type(1) || packet-data
         // Build packet data
-        try packet.append(@intFromEnum(packet_type));
-        try packet.appendSlice(payload);
+        try packet.append(self.allocator, @intFromEnum(packet_type));
+        try packet.appendSlice(self.allocator, payload);
 
         // Sign packet
         const hash = keccak256(packet.items);
-        const signature = try Crypto.unaudited_signHash(&self.priv_key, &hash);
+        const signature = try Crypto.unaudited_signHash(self.priv_key, hash);
 
         // Build final packet
-        var final_packet = std.ArrayList(u8).init(self.allocator);
-        defer final_packet.deinit();
+        var final_packet = std.ArrayList(u8){};
+        defer final_packet.deinit(self.allocator);
 
-        try final_packet.appendSlice(&hash);
-        try final_packet.appendSlice(&signature);
-        try final_packet.appendSlice(packet.items);
+        try final_packet.appendSlice(self.allocator, &hash);
+        const sig_bytes = signature.to_bytes();
+        try final_packet.appendSlice(self.allocator, &sig_bytes);
+        try final_packet.appendSlice(self.allocator, packet.items);
 
         // Send UDP packet
         _ = try std.posix.sendto(
@@ -685,9 +686,9 @@ pub const UDPv4 = struct {
         }
 
         // Verify signature and recover sender ID (public key hash)
-        const sender_pubkey = try Crypto.unaudited_recoverAddress(&computed_hash, signature);
+        const sender_address = try Crypto.unaudited_recoverAddress(computed_hash, signature);
         var sender_id: [32]u8 = undefined;
-        @memcpy(&sender_id, &sender_pubkey[0..32]);
+        @memcpy(&sender_id, &sender_address.data);
 
         // Dispatch based on packet type
         switch (packet_type) {
@@ -991,9 +992,9 @@ pub const KademliaTable = struct {
             };
         }
 
-        pub fn deinit(self: *Bucket) void {
-            self.entries.deinit();
-            self.replacements.deinit();
+        pub fn deinit(self: *Bucket, allocator: std.mem.Allocator) void {
+            self.entries.deinit(allocator);
+            self.replacements.deinit(allocator);
         }
     };
 
@@ -1016,7 +1017,7 @@ pub const KademliaTable = struct {
 
     pub fn deinit(self: *KademliaTable) void {
         for (&self.buckets) |*bucket| {
-            bucket.deinit();
+            bucket.deinit(self.allocator);
         }
         self.allocator.destroy(self);
     }
@@ -1057,7 +1058,7 @@ pub const KademliaTable = struct {
         // Node not in bucket, try to add it
         if (bucket.entries.items.len < BUCKET_SIZE) {
             // Bucket has space, add to front
-            try bucket.entries.insert(0, .{
+            try bucket.entries.insert(self.allocator, 0, .{
                 .node = node,
                 .added_at = now,
                 .liveness_checks = 0,
@@ -1092,7 +1093,7 @@ pub const KademliaTable = struct {
 
         // Add to end if bucket has space
         if (bucket.entries.items.len < BUCKET_SIZE) {
-            try bucket.entries.append(.{
+            try bucket.entries.append(self.allocator, .{
                 .node = node,
                 .added_at = now,
                 .liveness_checks = 0,
@@ -1105,7 +1106,7 @@ pub const KademliaTable = struct {
     }
 
     /// Add node to replacement list
-    fn addReplacement(_: *KademliaTable, bucket: *Bucket, node: Node, now: i64) !void {
+    fn addReplacement(self: *KademliaTable, bucket: *Bucket, node: Node, now: i64) !void {
         // Check if already in replacements
         for (bucket.replacements.items) |entry| {
             if (std.mem.eql(u8, &entry.node.id, &node.id)) {
@@ -1119,7 +1120,7 @@ pub const KademliaTable = struct {
             _ = bucket.replacements.orderedRemove(bucket.replacements.items.len - 1);
         }
 
-        try bucket.replacements.insert(0, .{
+        try bucket.replacements.insert(self.allocator, 0, .{
             .node = node,
             .added_at = now,
             .liveness_checks = 0,
@@ -1178,7 +1179,7 @@ pub const KademliaTable = struct {
                 // Add replacement if available
                 if (bucket.replacements.items.len > 0) {
                     const replacement = bucket.replacements.orderedRemove(0);
-                    try bucket.entries.append(replacement);
+                    try bucket.entries.append(self.allocator, replacement);
                     std.log.info("Replaced dead node with replacement", .{});
                 }
             }
@@ -1209,7 +1210,7 @@ pub const KademliaTable = struct {
 
         for (&self.buckets, 0..) |*bucket, i| {
             if (bucket.last_refresh < threshold) {
-                try candidates.append(i);
+                try candidates.append(self.allocator, i);
             }
         }
 
@@ -1228,7 +1229,7 @@ pub const KademliaTable = struct {
         for (self.buckets) |bucket| {
             for (bucket.entries.items) |entry| {
                 if (entry.liveness_checks > 0) {
-                    try candidates.append(entry.node);
+                    try candidates.append(self.allocator, entry.node);
                 }
             }
         }
@@ -1237,7 +1238,7 @@ pub const KademliaTable = struct {
         if (candidates.items.len == 0) {
             for (self.buckets) |bucket| {
                 for (bucket.entries.items) |entry| {
-                    try candidates.append(entry.node);
+                    try candidates.append(self.allocator, entry.node);
                 }
             }
         }
@@ -1272,7 +1273,7 @@ pub const KademliaTable = struct {
         for (self.buckets) |bucket| {
             for (bucket.entries.items) |entry| {
                 if (entry.liveness_checks > 0) {
-                    try all_nodes.append(entry.node);
+                    try all_nodes.append(self.allocator, entry.node);
                 }
             }
         }

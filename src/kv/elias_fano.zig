@@ -227,7 +227,8 @@ pub const EliasFano = struct {
 
         var lower = self.lower_bits[idx64] >> shift;
         if (shift > 0 and idx64 + 1 < self.lower_bits.len) {
-            lower |= self.lower_bits[idx64 + 1] << (64 - shift);
+            const rshift_amt = 64 - @as(u32, shift);
+            lower |= self.lower_bits[idx64 + 1] << @as(u6, @intCast(rshift_amt));
         }
         lower &= self.lower_bits_mask;
 
@@ -243,7 +244,8 @@ pub const EliasFano = struct {
 
         // Find i-th set bit in upper_bits starting from jump_pos
         var curr_word = jump_pos / 64;
-        var window = self.upper_bits[curr_word] & (0xffffffffffffffff << @intCast(jump_pos % 64));
+        const jump_bit_offset: u6 = @intCast(jump_pos % 64);
+        var window = self.upper_bits[curr_word] & (@as(u64, 0xffffffffffffffff) << jump_bit_offset);
         var d: i32 = @intCast(i & Q_MASK);
 
         while (@popCount(window) <= d) {
@@ -268,10 +270,11 @@ pub const EliasFano = struct {
     /// Get two consecutive elements (optimized)
     pub fn get2(self: *EliasFano, i: u64) struct { u64, u64 } {
         const first = self.getInternal(i);
-        var val = first.val;
+        const val = first.val;
 
         // Get next element by continuing from current position
-        var window = first.window & ((@as(u64, 0xffffffffffffffff) << first.sel) << 1);
+        const sel_shift: u6 = @intCast(@min(first.sel, 63));
+        var window = first.window & ((@as(u64, 0xffffffffffffffff) << sel_shift) << 1);
         var curr_word = first.curr_word;
 
         while (window == 0) {
@@ -289,7 +292,8 @@ pub const EliasFano = struct {
 
         var lower_next = self.lower_bits[idx64] >> shift;
         if (shift > 0 and idx64 + 1 < self.lower_bits.len) {
-            lower_next |= self.lower_bits[idx64 + 1] << (64 - shift);
+            const rshift_amt = 64 - @as(u32, shift);
+            lower_next |= self.lower_bits[idx64 + 1] << @as(u6, @intCast(rshift_amt));
         }
         lower_next &= self.lower_bits_mask;
 
@@ -308,10 +312,11 @@ pub const EliasFano = struct {
 
         const jump_base = self.jump[jump_super_q];
         const jump_offset = (self.jump[jump_idx] >> jump_shift) & 0xffffffff;
-        var bit_pos = jump_base + jump_offset;
+        const bit_pos = jump_base + jump_offset;
 
         var curr_word = bit_pos / 64;
-        var window = self.upper_bits[curr_word] & (0xffffffffffffffff << @intCast(bit_pos % 64));
+        const bit_offset: u6 = @intCast(bit_pos % 64);
+        var window = self.upper_bits[curr_word] & (@as(u64, 0xffffffffffffffff) << bit_offset);
         var d: i32 = @intCast(i & Q_MASK);
 
         while (@popCount(window) <= d) {
@@ -416,8 +421,10 @@ fn select64(word: u64, k: i32) u8 {
     var pos: u8 = 0;
 
     // Process 8 bits at a time
-    while (pos < 64) : (pos += 8) {
-        const byte_val: u8 = @truncate(word >> pos);
+    while (pos < 64) {
+        const shift_amt: u6 = @intCast(pos);
+        const byte_val: u8 = @truncate(word >> shift_amt);
+        pos += 8;
         const bit_count: i32 = @popCount(byte_val);
 
         if (bit_count > remaining) {

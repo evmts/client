@@ -384,47 +384,11 @@ pub const Transaction = struct {
     }
 };
 
-/// Transaction receipt matching Erigon
-pub const Receipt = struct {
-    tx_type: TransactionType,
-    status: u8, // 0 = failure, 1 = success (post-Byzantium)
-    cumulative_gas_used: u64,
-    logs_bloom: Bloom,
-    logs: []Log,
-
-    // Pre-Byzantium: state root instead of status
-    post_state: ?[32]u8,
-
-    pub fn deinit(self: *Receipt, allocator: std.mem.Allocator) void {
-        for (self.logs) |log| {
-            allocator.free(log.topics);
-        }
-        allocator.free(self.logs);
-    }
-
-    pub fn success(self: *const Receipt) bool {
-        // Post-Byzantium uses status field
-        if (self.post_state == null) {
-            return self.status == 1;
-        }
-        // Pre-Byzantium always returns true (check state root separately)
-        return true;
-    }
-};
-
-/// Event log matching Erigon
-pub const Log = struct {
-    address: Address,
-    topics: [][32]u8,
-    data: []const u8,
-
-    // Additional metadata (not part of consensus)
-    block_number: ?u64 = null,
-    transaction_hash: ?[32]u8 = null,
-    transaction_index: ?u64 = null,
-    log_index: ?u64 = null,
-    removed: bool = false, // True if log was reverted due to chain reorg
-};
+/// Re-export Receipt and Log from types module
+pub const receipt_types = @import("types/receipt.zig");
+pub const Receipt = receipt_types.Receipt;
+pub const Log = receipt_types.Log;
+pub const Receipts = receipt_types.Receipts;
 
 /// Withdrawal (EIP-4895)
 pub const Withdrawal = struct {

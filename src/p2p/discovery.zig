@@ -983,9 +983,10 @@ pub const KademliaTable = struct {
         last_refresh: i64,
 
         pub fn init(allocator: std.mem.Allocator) Bucket {
+            _ = allocator;
             return .{
-                .entries = std.ArrayList(BucketEntry).init(allocator),
-                .replacements = std.ArrayList(BucketEntry).init(allocator),
+                .entries = std.ArrayList(BucketEntry){},
+                .replacements = std.ArrayList(BucketEntry){},
                 .last_refresh = 0,
             };
         }

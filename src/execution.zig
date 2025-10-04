@@ -15,20 +15,42 @@ const chain = @import("chain.zig");
 const state = @import("state.zig");
 const crypto = @import("crypto.zig");
 
+/// Execution errors matching Erigon's core/error.go
 pub const ExecutionError = error{
-    InsufficientFunds,
-    NonceTooHigh,
+    // Block-level errors
+    KnownBlock,
+    BlacklistedHash,
+    NoGenesis,
+    InternalFailure,
+    StateTransitionFailed,
+    BlockExceedsMaxRlpSize,
+
+    // Transaction validation errors
     NonceTooLow,
+    NonceTooHigh,
     NonceMax,
-    GasLimitTooHigh,
-    TipAboveFeeCap,
+    GasLimitReached,
+    BlobGasLimitReached,
+    MaxInitCodeSizeExceeded,
+    InsufficientFunds,
+    GasUintOverflow,
+    IntrinsicGas,
+    TxTypeNotSupported,
     FeeCapTooLow,
     SenderNoEOA,
+    GasLimitTooHigh,
+
+    // EIP-1559 errors
+    TipAboveFeeCap,
+    TipVeryHigh,
+    FeeCapVeryHigh,
+
+    // EIP-4844 (blob) errors
     MaxFeePerBlobGasTooLow,
     TooManyBlobs,
+
+    // Generic errors
     InvalidTransaction,
-    StateTransitionFailed,
-    InternalFailure,
     OutOfGas,
 };
 
@@ -46,14 +68,14 @@ pub const GasPool = struct {
 
     pub fn subGas(self: *GasPool, amount: u64) !void {
         if (amount > self.gas) {
-            return ExecutionError.OutOfGas;
+            return ExecutionError.GasLimitReached;
         }
         self.gas -= amount;
     }
 
     pub fn subBlobGas(self: *GasPool, amount: u64) !void {
         if (amount > self.blob_gas) {
-            return ExecutionError.OutOfGas;
+            return ExecutionError.BlobGasLimitReached;
         }
         self.blob_gas -= amount;
     }

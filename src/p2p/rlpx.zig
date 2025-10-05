@@ -20,8 +20,8 @@ const Allocator = std.mem.Allocator;
 const snappy = @import("snappy.zig");
 
 // Import guillotine crypto primitives for secp256k1 operations
-const guillotine = @import("guillotine");
-const secp256k1 = guillotine.crypto.secp256k1;
+const guillotine_primitives = @import("guillotine_primitives");
+const secp256k1 = guillotine_primitives.crypto.secp256k1;
 
 // Constants
 const maxUint24: u32 = 0xFFFFFF;
@@ -175,6 +175,36 @@ pub const Conn = struct {
         return .{ .code = code, .data = payload, .wireSize = wireSize };
     }
 
+    /// Perform protocol handshake (Hello exchange)
+    /// Returns the remote peer's Hello message
+    pub fn doProtoHandshake(self: *Self, our_hello: anytype) !@TypeOf(our_hello) {
+        const devp2p = @import("devp2p.zig");
+
+        // Send our Hello message
+        const hello_payload = try our_hello.encode(self.allocator);
+        defer self.allocator.free(hello_payload);
+
+        _ = try self.writeMsg(@intFromEnum(devp2p.BaseMessageType.hello), hello_payload);
+
+        // Receive their Hello message
+        const msg = try self.readMsg();
+        defer self.allocator.free(msg.data);
+
+        if (msg.code != @intFromEnum(devp2p.BaseMessageType.hello)) {
+            return error.ProtocolError;
+        }
+
+        // Decode their Hello
+        const their_hello = try devp2p.Hello.decode(self.allocator, msg.data);
+
+        // Check protocol version compatibility
+        if (their_hello.protocol_version < 5) {
+            return error.IncompatibleProtocolVersion;
+        }
+
+        return their_hello;
+    }
+
     /// Write a message to the connection
     /// Returns the wire size (may be compressed)
     pub fn writeMsg(self: *Self, code: u64, payload: []const u8) !u32 {
@@ -202,17 +232,17 @@ pub const Conn = struct {
         const wireSize: u32 = @intCast(data.len);
 
         // Encode as RLP: [code, data]
-        var encoded = std.ArrayList(u8).init(self.allocator);
-        defer encoded.deinit();
+        var encoded = std.ArrayList(u8){};
+        defer encoded.deinit(self.allocator);
 
         // Encode code
         if (code == 0) {
-            try encoded.append(0x80); // Empty string
+            try encoded.append(self.allocator, 0x80); // Empty string
         } else if (code < 0x80) {
-            try encoded.append(@intCast(code));
+            try encoded.append(self.allocator, @intCast(code));
         } else if (code < 0x100) {
-            try encoded.append(0x81);
-            try encoded.append(@intCast(code));
+            try encoded.append(self.allocator, 0x81);
+            try encoded.append(self.allocator, @intCast(code));
         } else {
             // Multi-byte encoding
             var temp: [8]u8 = undefined;
@@ -222,12 +252,12 @@ pub const Conn = struct {
                 temp[7 - len] = @intCast(val & 0xFF);
                 val >>= 8;
             }
-            try encoded.append(0x80 + @as(u8, @intCast(len)));
-            try encoded.appendSlice(temp[8 - len ..]);
+            try encoded.append(self.allocator, 0x80 + @as(u8, @intCast(len)));
+            try encoded.appendSlice(self.allocator, temp[8 - len ..]);
         }
 
         // Append payload (compressed or not)
-        try encoded.appendSlice(data);
+        try encoded.appendSlice(self.allocator, data);
 
         // Write frame
         try session.writeFrame(&self.stream, encoded.items);
@@ -248,9 +278,9 @@ const Secrets = struct {
 /// Encryption session state
 pub const SessionState = struct {
     allocator: Allocator,
-    enc_cipher: crypto.core.aes.Aes256, // Egress AES-256
-    dec_cipher: crypto.core.aes.Aes256, // Ingress AES-256
-    mac_cipher: crypto.core.aes.Aes128, // MAC encryption
+    enc_cipher: @TypeOf(crypto.core.aes.Aes256.initEnc([_]u8{0} ** 32)), // Egress AES-256
+    dec_cipher: @TypeOf(crypto.core.aes.Aes256.initEnc([_]u8{0} ** 32)), // Ingress AES-256
+    mac_cipher: @TypeOf(crypto.core.aes.Aes128.initEnc([_]u8{0} ** 16)), // MAC encryption
     egress_mac: crypto.hash.sha3.Keccak256,
     ingress_mac: crypto.hash.sha3.Keccak256,
     enc_ctr: [16]u8, // Encryption counter
@@ -438,7 +468,7 @@ pub const SessionState = struct {
 
     fn xorKeyStream(
         self: *Self,
-        cipher: *const crypto.core.aes.Aes256,
+        cipher: *const @TypeOf(crypto.core.aes.Aes256.initEnc([_]u8{0} ** 32)),
         ctr: *[16]u8,
         dst: []u8,
         src: []const u8,
@@ -596,21 +626,21 @@ const HandshakeState = struct {
         const our_pubkey = try self.publicKeyFromPrivate(priv_key);
 
         // 5. Encode auth message as RLP: [signature, initiator-pubkey, nonce, version]
-        var msg_buf = std.ArrayList(u8).init(self.allocator);
-        defer msg_buf.deinit();
+        var msg_buf = std.ArrayList(u8){};
+        defer msg_buf.deinit(self.allocator);
 
         // RLP encode manually (simplified - real RLP would be more complex)
-        try msg_buf.appendSlice(&signature); // 65 bytes
-        try msg_buf.appendSlice(&our_pubkey); // 64 bytes
-        try msg_buf.appendSlice(&self.init_nonce); // 32 bytes
-        try msg_buf.append(4); // version
+        try msg_buf.appendSlice(self.allocator, &signature); // 65 bytes
+        try msg_buf.appendSlice(self.allocator, &our_pubkey); // 64 bytes
+        try msg_buf.appendSlice(self.allocator, &self.init_nonce); // 32 bytes
+        try msg_buf.append(self.allocator, 4); // version
 
         // 6. Add random padding (100-300 bytes) for EIP-8
         var rng = crypto.random;
         const padding_len = 100 + (rng.int(u8) % 200);
         var i: usize = 0;
         while (i < padding_len) : (i += 1) {
-            try msg_buf.append(0);
+            try msg_buf.append(self.allocator, 0);
         }
 
         // 7. Encrypt with ECIES using remote public key
@@ -640,26 +670,150 @@ const HandshakeState = struct {
     }
 
     fn deriveSecrets(self: *HandshakeState, auth: []const u8, authResp: []const u8) !Secrets {
-        _ = auth;
-        _ = authResp;
+        // Compute ephemeral ECDH shared secret
+        const ecdh_shared = try self.ecdhSharedSecret(self.ephemeral_priv, self.remote_ephemeral_pub);
 
-        // TODO: Implement proper ECDH secret derivation and key derivation
-        // This should:
-        // 1. Compute ECDH shared secret from ephemeral keys
-        // 2. Derive AES and MAC keys using Keccak256
+        // Key derivation following Ethereum's RLPx spec:
+        // 1. shared-secret = keccak256(ephemeral-shared-secret || keccak256(nonce || initiator-nonce))
+        var nonce_material: [64]u8 = undefined;
+        if (self.initiator) {
+            @memcpy(nonce_material[0..32], &self.resp_nonce);
+            @memcpy(nonce_material[32..64], &self.init_nonce);
+        } else {
+            @memcpy(nonce_material[0..32], &self.init_nonce);
+            @memcpy(nonce_material[32..64], &self.resp_nonce);
+        }
+
+        var nonce_hash: [32]u8 = undefined;
+        crypto.hash.sha3.Keccak256.hash(&nonce_material, &nonce_hash, .{});
+
+        var shared_secret_material: [64]u8 = undefined;
+        @memcpy(shared_secret_material[0..32], &ecdh_shared);
+        @memcpy(shared_secret_material[32..64], &nonce_hash);
+
+        var shared_secret: [32]u8 = undefined;
+        crypto.hash.sha3.Keccak256.hash(&shared_secret_material, &shared_secret, .{});
+
+        // 2. Derive AES and MAC keys
+        var aes_secret: [32]u8 = undefined;
+        var mac_secret: [32]u8 = undefined;
+
+        // AES key = keccak256(shared-secret || [0x00])
+        var aes_material: [33]u8 = undefined;
+        @memcpy(aes_material[0..32], &shared_secret);
+        aes_material[32] = 0x00;
+        crypto.hash.sha3.Keccak256.hash(&aes_material, &aes_secret, .{});
+
+        // MAC key = keccak256(shared-secret || [0x01])
+        var mac_material: [33]u8 = undefined;
+        @memcpy(mac_material[0..32], &shared_secret);
+        mac_material[32] = 0x01;
+        crypto.hash.sha3.Keccak256.hash(&mac_material, &mac_secret, .{});
+
         // 3. Initialize MAC states
+        var egress_mac = crypto.hash.sha3.Keccak256.init(.{});
+        var ingress_mac = crypto.hash.sha3.Keccak256.init(.{});
+
+        // XOR MAC key with nonces
+        var mac_init: [32]u8 = undefined;
+        for (mac_secret, 0..) |byte, i| {
+            mac_init[i] = byte ^ nonce_hash[i];
+        }
+
+        if (self.initiator) {
+            egress_mac.update(&mac_init);
+            egress_mac.update(auth);
+            ingress_mac.update(&mac_init);
+            ingress_mac.update(authResp);
+        } else {
+            egress_mac.update(&mac_init);
+            egress_mac.update(authResp);
+            ingress_mac.update(&mac_init);
+            ingress_mac.update(auth);
+        }
 
         var secrets: Secrets = undefined;
         secrets.remote_pubkey = self.remote_pubkey;
-
-        // Placeholder - would be derived from ECDH
-        @memset(&secrets.aes, 0);
-        @memset(&secrets.mac, 0);
-
-        secrets.egress_mac = crypto.hash.sha3.Keccak256.init(.{});
-        secrets.ingress_mac = crypto.hash.sha3.Keccak256.init(.{});
+        secrets.aes = aes_secret;
+        @memcpy(&secrets.mac, mac_secret[0..16]); // Use first 16 bytes for AES-128
+        secrets.egress_mac = egress_mac;
+        secrets.ingress_mac = ingress_mac;
 
         return secrets;
+    }
+
+    fn ecdhSharedSecret(self: *HandshakeState, priv_key: [32]u8, pub_key: [64]u8) ![32]u8 {
+        _ = self;
+
+        // ECDH shared secret using affine point multiplication
+        // shared_secret = priv_key * pub_key_point
+
+        // Parse public key coordinates
+        const pub_x = std.mem.readInt(u256, pub_key[0..32], .big);
+        const pub_y = std.mem.readInt(u256, pub_key[32..64], .big);
+
+        const pub_point = secp256k1.AffinePoint{
+            .x = pub_x,
+            .y = pub_y,
+            .infinity = false,
+        };
+
+        // Point validation would go here in production
+        // if (!pub_point.isValid()) return Error.InvalidPublicKey;
+
+        // Convert private key to scalar value
+        const priv_scalar = std.mem.readInt(u256, &priv_key, .big);
+
+        // Compute shared point
+        const shared_point = pub_point.scalar_mul(priv_scalar);
+
+        // Return X coordinate as shared secret (standard ECDH)
+        var result: [32]u8 = undefined;
+        std.mem.writeInt(u256, &result, shared_point.x, .big);
+        return result;
+    }
+
+    fn publicKeyFromPrivate(self: *HandshakeState, priv_key: [32]u8) ![64]u8 {
+        _ = self;
+
+        // Derive public key from private key
+        const priv_scalar = std.mem.readInt(u256, &priv_key, .big);
+        const pub_point = secp256k1.AffinePoint.generator().scalar_mul(priv_scalar);
+
+        // Get uncompressed pubkey (64 bytes, no 0x04 prefix)
+        var result: [64]u8 = undefined;
+        std.mem.writeInt(u256, result[0..32], pub_point.x, .big);
+        std.mem.writeInt(u256, result[32..64], pub_point.y, .big);
+        return result;
+    }
+
+    fn sign(self: *HandshakeState, msg_hash: [32]u8, priv_key: [32]u8) ![65]u8 {
+        _ = self;
+
+        // Signing using guillotine Crypto.unaudited_signHash
+        const Crypto = guillotine_primitives.crypto.Crypto;
+        const sig = try Crypto.unaudited_signHash(priv_key, msg_hash);
+
+        return sig.to_bytes();
+    }
+
+    fn sealEIP8(self: *HandshakeState, plaintext: []const u8, remote_pubkey: [64]u8) ![]u8 {
+        _ = self;
+        _ = remote_pubkey;
+
+        // EIP-8 ECIES encryption (simplified - full implementation would use proper ECIES)
+        // For now, return error to indicate it needs proper implementation
+
+        // Full implementation would:
+        // 1. Generate ephemeral key pair
+        // 2. Compute shared secret via ECDH
+        // 3. Derive AES and MAC keys using KDF
+        // 4. Encrypt plaintext with AES-CTR
+        // 5. Compute HMAC-SHA256
+        // 6. Return: [size(2)] || [ephemeral-pubkey(65)] || [iv(16)] || [ciphertext] || [mac(32)]
+
+        _ = plaintext;
+        return Error.HandshakeFailed;
     }
 };
 
@@ -689,8 +843,8 @@ const ReadBuffer = struct {
     }
 
     fn read(self: *ReadBuffer, allocator: Allocator, stream: *net.Stream, n: usize) ![]u8 {
-        if (self.data.items.ptr == null) {
-            self.data = std.ArrayList(u8).init(allocator);
+        if (self.data.items.len == 0 and self.data.capacity == 0) {
+            self.data = std.ArrayList(u8){};
         }
 
         const offset = self.data.items.len;
@@ -731,8 +885,8 @@ const WriteBuffer = struct {
     }
 
     fn write(self: *WriteBuffer, allocator: Allocator, bytes: []const u8) !void {
-        if (self.data.items.ptr == null) {
-            self.data = std.ArrayList(u8).init(allocator);
+        if (self.data.items.len == 0 and self.data.capacity == 0) {
+            self.data = std.ArrayList(u8){};
         }
         try self.data.appendSlice(allocator, bytes);
     }

@@ -78,7 +78,7 @@ pub const Hello = struct {
     }
 
     pub fn encode(self: *const Hello, allocator: std.mem.Allocator) ![]u8 {
-        const rlp = @import("primitives").rlp;
+        const rlp = @import("guillotine_primitives").Rlp;
         var encoder = rlp.Encoder.init(allocator);
         defer encoder.deinit();
 
@@ -103,20 +103,20 @@ pub const Hello = struct {
     }
 
     pub fn decode(allocator: std.mem.Allocator, data: []const u8) !Hello {
-        const rlp = @import("primitives").rlp;
+        const rlp = @import("guillotine_primitives").Rlp;
         var decoder = rlp.Decoder.init(data);
         var list = try decoder.enterList();
 
         const protocol_version: u8 = @intCast(try list.decodeInt());
         const client_id = try allocator.dupe(u8, try list.decodeBytesView());
 
-        var caps = std.ArrayList(Capability).init(allocator);
+        var caps = std.ArrayList(Capability){};
         var caps_list = try list.enterList();
         while (!caps_list.isEmpty()) {
             var cap_list = try caps_list.enterList();
             const name = try allocator.dupe(u8, try cap_list.decodeBytesView());
             const version: u8 = @intCast(try cap_list.decodeInt());
-            try caps.append(.{ .name = name, .version = version });
+            try caps.append(allocator, .{ .name = name, .version = version });
         }
 
         const listen_port: u16 = @intCast(try list.decodeInt());
@@ -127,7 +127,7 @@ pub const Hello = struct {
         return .{
             .protocol_version = protocol_version,
             .client_id = client_id,
-            .capabilities = try caps.toOwnedSlice(),
+            .capabilities = try caps.toOwnedSlice(allocator),
             .listen_port = listen_port,
             .node_id = node_id,
         };
@@ -139,7 +139,7 @@ pub const Disconnect = struct {
     reason: DisconnectReason,
 
     pub fn encode(self: *const Disconnect, allocator: std.mem.Allocator) ![]u8 {
-        const rlp = @import("primitives").rlp;
+        const rlp = @import("guillotine_primitives").Rlp;
         var encoder = rlp.Encoder.init(allocator);
         defer encoder.deinit();
 
@@ -194,7 +194,7 @@ pub const StatusMessage = struct {
     };
 
     pub fn encode(self: *const StatusMessage, allocator: std.mem.Allocator) ![]u8 {
-        const rlp = @import("primitives").rlp;
+        const rlp = @import("guillotine_primitives").Rlp;
         var encoder = rlp.Encoder.init(allocator);
         defer encoder.deinit();
 
@@ -218,7 +218,7 @@ pub const StatusMessage = struct {
     }
 
     pub fn decode(data: []const u8, allocator: std.mem.Allocator) !StatusMessage {
-        const rlp = @import("primitives").rlp;
+        const rlp = @import("guillotine_primitives").Rlp;
         var decoder = rlp.Decoder.init(data);
         var list = try decoder.enterList();
 
@@ -327,7 +327,7 @@ pub const NewBlockMessage = struct {
     total_difficulty: [32]u8,
 };
 
-/// Peer connection
+/// Peer connection (legacy - use server.zig Peer instead)
 pub const Peer = struct {
     id: [32]u8,
     address: std.net.Address,
@@ -337,6 +337,7 @@ pub const Peer = struct {
     best_hash: [32]u8,
     connected: bool,
     last_seen: u64,
+    rlpx_conn: ?*@import("rlpx.zig").Conn = null, // Optional RLPx connection
 
     pub fn handshake(self: *Peer, status: StatusMessage) !void {
         self.protocol_version = @enumFromInt(status.protocol_version);
@@ -360,28 +361,14 @@ pub const Peer = struct {
             data.len,
         });
 
-        // RLPx message framing:
-        // 1. Message code is the first byte (msg_type as u8)
-        // 2. Message payload follows
-        // 3. The RLPx layer (via rlpx.zig) handles encryption, MAC, and framing
-        //
-        // For production:
-        // - Create RLPx connection (from rlpx.zig)
-        // - Call conn.writeMsg(@intFromEnum(msg_type), data)
-        // - RLPx handles: RLP encoding, snappy compression (if enabled), encryption, MAC
-        //
-        // Message format after RLPx processing:
-        // [frame-header(32)][frame-data(encrypted)][frame-mac(16)]
-        // where frame-header = [frame-size(3)][protocol-header(13)]
-        //
-        // Note: In the current stub, we would need to:
-        // 1. Store an RLPx connection in Peer
-        // 2. Call rlpx_conn.writeMsg() here
-        // 3. Handle network I/O errors appropriately
-
-        // TODO: Implement actual RLPx connection and message sending
-        // For now, this is a stub that will be implemented when we integrate
-        // the full P2P networking stack with TCP connections
+        // Send via RLPx connection if available
+        if (self.rlpx_conn) |conn| {
+            // Message code offset: base messages (0x00-0x0F) + protocol messages (0x10+)
+            const code = @intFromEnum(msg_type) + 0x10; // Protocol messages start at 0x10
+            _ = try conn.writeMsg(code, data);
+        } else {
+            return error.NoRLPxConnection;
+        }
     }
 
     pub fn disconnect(self: *Peer, reason: []const u8) void {
@@ -582,7 +569,7 @@ pub const NetworkManager = struct {
         // where origin is either block_number (uint64) or block_hash ([32]u8)
         //
         // Implementation:
-        const rlp = @import("primitives").rlp;
+        const rlp = @import("guillotine_primitives").Rlp;
         var encoder = rlp.Encoder.init(self.allocator);
         defer encoder.deinit();
 
@@ -630,7 +617,7 @@ pub const NetworkManager = struct {
             // - number: block number
             //
             // For a single block announcement:
-            const rlp = @import("primitives").rlp;
+            const rlp = @import("guillotine_primitives").Rlp;
             var encoder = rlp.Encoder.init(self.allocator);
             defer encoder.deinit();
 

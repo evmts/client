@@ -39,7 +39,7 @@ pub fn run(self: *Server) !void {
         // Log stats periodically
         const now = std.time.milliTimestamp();
         if (now - stats_timer > SERVER_STATS_LOG_INTERVAL_MS) {
-            self.logStats(inbound_count);
+            logStats(self, inbound_count);
             stats_timer = now;
         }
 
@@ -315,7 +315,7 @@ fn runPeerThread(self: *Server, peer: *Peer) !void {
 
     // Add to delete queue
     self.del_peer_mutex.lock();
-    try self.del_peer_queue.append(.{ .peer = peer, .err = err });
+    try self.del_peer_queue.append(self.allocator, .{ .peer = peer, .err = err });
     self.del_peer_mutex.unlock();
 }
 
@@ -354,18 +354,28 @@ pub fn setupConnHandshakes(self: *Server, conn: *Conn, dial_dest: ?discovery.Nod
     }
 
     // Checkpoint: post-handshake (check trust list, set trusted flag)
-    try self.checkpoint(conn, .post_handshake);
+    try checkpoint(self, conn, .post_handshake);
 
     // Perform protocol handshake
-    const our_handshake = try self.buildHandshake();
-    const their_handshake = try conn.transport.doProtoHandshake(our_handshake);
+    const our_handshake = try buildHandshake(self);
+    defer self.allocator.free(our_handshake.capabilities);
 
-    // Store capabilities and name
-    conn.caps = try self.allocator.dupe(devp2p.Capability, their_handshake.caps);
-    conn.name = try self.allocator.dupe(u8, their_handshake.name);
+    const their_handshake = try conn.transport.doProtoHandshake(our_handshake);
+    defer their_handshake.deinit(self.allocator);
+
+    // Convert and store capabilities
+    var caps = try self.allocator.alloc(Cap, their_handshake.capabilities.len);
+    for (their_handshake.capabilities, 0..) |cap, i| {
+        caps[i] = .{
+            .name = cap.name,
+            .version = cap.version,
+        };
+    }
+    conn.caps = caps;
+    conn.name = try self.allocator.dupe(u8, their_handshake.client_id);
 
     // Checkpoint: add peer (check peer limits, add to peer map)
-    try self.checkpoint(conn, .add_peer);
+    try checkpoint(self, conn, .add_peer);
 }
 
 /// Checkpoint - synchronizes with main run loop
@@ -380,12 +390,12 @@ fn checkpoint(self: *Server, conn: *Conn, stage: enum { post_handshake, add_peer
     switch (stage) {
         .post_handshake => {
             self.checkpoint_post_mutex.lock();
-            try self.checkpoint_post_handshake_queue.append(msg);
+            try self.checkpoint_post_handshake_queue.append(self.allocator, msg);
             self.checkpoint_post_mutex.unlock();
         },
         .add_peer => {
             self.checkpoint_add_mutex.lock();
-            try self.checkpoint_add_peer_queue.append(msg);
+            try self.checkpoint_add_peer_queue.append(self.allocator, msg);
             self.checkpoint_add_mutex.unlock();
         },
     }
@@ -405,38 +415,55 @@ fn checkpoint(self: *Server, conn: *Conn, stage: enum { post_handshake, add_peer
 }
 
 /// Build our handshake message
-fn buildHandshake(self: *Server) !devp2p.ProtoHandshake {
-    var caps = try self.allocator.alloc(Cap, self.config.protocols.len);
+fn buildHandshake(self: *Server) !devp2p.Hello {
+    var caps = try self.allocator.alloc(devp2p.Hello.Capability, self.config.protocols.len);
     for (self.config.protocols, 0..) |proto, i| {
         caps[i] = .{
             .name = proto.name,
-            .version = proto.version,
+            .version = @intCast(proto.version),
         };
     }
 
+    // Derive public key from private key for node ID
+    const guillotine_primitives = @import("guillotine_primitives");
+    const secp256k1 = guillotine_primitives.crypto.secp256k1;
+
+    const priv_scalar = std.mem.readInt(u256, &self.config.priv_key, .big);
+    const pub_point = secp256k1.AffinePoint.generator().scalar_mul(priv_scalar);
+
+    var node_id: [64]u8 = undefined;
+    std.mem.writeInt(u256, node_id[0..32], pub_point.x, .big);
+    std.mem.writeInt(u256, node_id[32..64], pub_point.y, .big);
+
     return .{
-        .version = 5, // baseProtocolVersion
-        .name = self.config.name,
-        .caps = caps,
-        .listen_port = 0, // TODO: Get from config
-        .id = &[_]u8{0} ** 64, // TODO: Get from private key
+        .protocol_version = 5, // baseProtocolVersion
+        .client_id = self.config.name,
+        .capabilities = caps,
+        .listen_port = self.config.listen_addr.getPort(),
+        .node_id = node_id,
     };
 }
 
 /// Check inbound connection (throttling)
 pub fn checkInboundConn(self: *Server, fd: std.net.Stream) !void {
-    const remote_addr = fd.getLocalAddress() catch return error.NoRemoteAddress;
+    // Get remote address from socket
+    var addr: std.posix.sockaddr = undefined;
+    var addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
+
+    std.posix.getpeername(fd.handle, &addr, &addr_len) catch return error.NoRemoteAddress;
+
+    const remote_addr = std.net.Address{ .any = addr };
 
     // Get IP string
     var ip_buf: [64]u8 = undefined;
     const ip_str = switch (remote_addr.any.family) {
         std.posix.AF.INET => blk: {
-            const addr = remote_addr.in;
+            const in_addr = remote_addr.in;
             break :blk try std.fmt.bufPrint(&ip_buf, "{}.{}.{}.{}", .{
-                addr.sa.addr >> 0 & 0xFF,
-                addr.sa.addr >> 8 & 0xFF,
-                addr.sa.addr >> 16 & 0xFF,
-                addr.sa.addr >> 24 & 0xFF,
+                in_addr.sa.addr >> 0 & 0xFF,
+                in_addr.sa.addr >> 8 & 0xFF,
+                in_addr.sa.addr >> 16 & 0xFF,
+                in_addr.sa.addr >> 24 & 0xFF,
             });
         },
         else => return, // Skip check for non-IPv4
@@ -461,12 +488,12 @@ pub fn checkInboundConn(self: *Server, fd: std.net.Stream) !void {
 
 /// Calculate max inbound connections
 pub fn maxInboundConns(self: *Server) u32 {
-    const max_dialed = self.maxDialedConns();
+    const max_dialed = maxDialedConns(self);
     return self.config.max_peers - max_dialed;
 }
 
 /// Calculate max dialed connections
-fn maxDialedConns(self: *Server) u32 {
+pub fn maxDialedConns(self: *Server) u32 {
     if (self.config.max_peers == 0) return 0;
 
     const ratio = if (self.config.dial_ratio == 0) DEFAULT_DIAL_RATIO else self.config.dial_ratio;

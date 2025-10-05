@@ -12,7 +12,7 @@
 //! - Peer event feed/subscription system
 
 const std = @import("std");
-const rlp = @import("primitives").rlp;
+const rlp = @import("guillotine_primitives").Rlp;
 const rlpx = @import("rlpx.zig");
 const discovery = @import("discovery.zig");
 const devp2p = @import("devp2p.zig");
@@ -115,13 +115,13 @@ const ExpHeap = struct {
         self.items.deinit(self.allocator);
     }
 
-    fn add(self: *ExpHeap, item: []const u8, exp_time: i64) !void {
+    pub fn add(self: *ExpHeap, item: []const u8, exp_time: i64) !void {
         const owned = try self.allocator.dupe(u8, item);
         try self.items.append(self.allocator, .{ .item = owned, .exp_time = exp_time });
         self.siftUp(self.items.items.len - 1);
     }
 
-    fn contains(self: *ExpHeap, item: []const u8) bool {
+    pub fn contains(self: *ExpHeap, item: []const u8) bool {
         for (self.items.items) |exp_item| {
             if (std.mem.eql(u8, exp_item.item, item)) {
                 return true;
@@ -130,7 +130,7 @@ const ExpHeap = struct {
         return false;
     }
 
-    fn expire(self: *ExpHeap, now: i64) void {
+    pub fn expire(self: *ExpHeap, now: i64) void {
         while (self.items.items.len > 0 and self.items.items[0].exp_time < now) {
             const item = self.items.orderedRemove(0);
             self.allocator.free(item.item);
@@ -173,7 +173,7 @@ const ExpHeap = struct {
 };
 
 /// Connection checkpoint message
-const CheckpointMsg = struct {
+pub const CheckpointMsg = struct {
     conn: *Conn,
     result: ?anyerror,
     completed: bool,
@@ -409,7 +409,7 @@ pub const Server = struct {
             .reuse_address = true,
         });
 
-        std.log.info("P2P server listening on {}", .{self.config.listen_addr});
+        std.log.info("P2P server listening on {any}", .{self.config.listen_addr});
 
         // Start main run loop
         self.loop_thread = try std.Thread.spawn(.{}, runLoop, .{self});
@@ -512,7 +512,7 @@ pub const Server = struct {
     fn listenLoop(self: *Self) !void {
         if (self.listener == null) return;
 
-        std.log.info("TCP listener up on {}", .{self.config.listen_addr});
+        std.log.info("TCP listener up on {any}", .{self.config.listen_addr});
 
         while (self.running.load(.acquire)) {
             const conn = self.listener.?.accept() catch |err| {
@@ -751,42 +751,42 @@ pub const Peer = struct {
 
             const msg = self.conn.transport.readMsg() catch |err| {
                 if (err == error.WouldBlock) {
-                    std.time.sleep(10 * std.time.ns_per_ms);
+                    std.Thread.sleep(10 * std.time.ns_per_ms);
                     continue;
                 }
                 std.log.err("Peer read error: {}", .{err});
                 self.disconnect(.tcp_error);
                 return err;
             };
-            defer self.allocator.free(msg.payload);
+            defer self.allocator.free(msg.data);
 
             // Handle base protocol messages
             if (msg.code <= 0x03) {
-                self.handleBaseMessage(msg.code, msg.payload) catch |err| {
+                self.handleBaseMessage(msg.code, msg.data) catch |err| {
                     std.log.err("Base message handling error: {}", .{err});
                 };
             } else {
                 // Dispatch to protocol handler
-                self.handleMessage(msg.code, msg.payload) catch |err| {
+                self.handleMessage(msg.code, msg.data) catch |err| {
                     std.log.err("Protocol message handling error: {}", .{err});
                 };
             }
         }
 
-        return null;
+        return error.NullReturn;
     }
 
     /// Send keepalive ping
     fn sendPing(self: *Self) !void {
         // Empty ping message
-        try self.conn.transport.writeMsg(@intFromEnum(devp2p.BaseMessageType.ping), &[_]u8{});
+        _ = try self.conn.transport.writeMsg(@intFromEnum(devp2p.BaseMessageType.ping), &[_]u8{});
         self.last_ping = std.time.timestamp();
         std.log.debug("Sent keepalive ping to peer", .{});
     }
 
     /// Send pong response
     fn sendPong(self: *Self) !void {
-        try self.conn.transport.writeMsg(@intFromEnum(devp2p.BaseMessageType.pong), &[_]u8{});
+        _ = try self.conn.transport.writeMsg(@intFromEnum(devp2p.BaseMessageType.pong), &[_]u8{});
         std.log.debug("Sent pong to peer", .{});
     }
 
@@ -807,7 +807,7 @@ pub const Peer = struct {
 
                 std.log.info("Peer disconnected: {}", .{reason});
                 self.disconnect_reason = reason;
-                self.running = false;
+                self.running.store(false, .release);
             },
             .ping => {
                 // Respond with pong
@@ -854,10 +854,10 @@ pub const Peer = struct {
         };
         defer self.allocator.free(payload);
 
-        self.conn.transport.writeMsg(@intFromEnum(devp2p.BaseMessageType.disconnect), payload) catch {};
+        _ = self.conn.transport.writeMsg(@intFromEnum(devp2p.BaseMessageType.disconnect), payload) catch 0;
 
         // Allow some time for message to be sent
-        std.time.sleep(100 * std.time.ns_per_ms);
+        std.Thread.sleep(100 * std.time.ns_per_ms);
 
         self.state = .disconnected;
         self.running.store(false, .release);

@@ -717,24 +717,23 @@ pub const UDPv4 = struct {
             return error.ExpiredPacket;
         }
 
-        // Create ENR response (simplified - would include actual ENR record)
-        var response = std.ArrayList(u8).init(self.allocator);
-        defer response.deinit();
+        // Create basic ENR (Ethereum Node Record)
+        const enr = try self.buildENR();
+        defer self.allocator.free(enr.encoded);
 
         var encoder = rlp.Encoder.init(self.allocator);
         defer encoder.deinit();
 
         try encoder.startList();
         try encoder.writeBytes(request_hash); // Reply token
-        // TODO: Add actual ENR record here
-        try encoder.writeInt(@as(u64, 0)); // Placeholder ENR seq
+        try encoder.writeBytes(enr.encoded); // ENR record
         try encoder.endList();
 
         const enr_payload = try encoder.toOwnedSlice();
         defer self.allocator.free(enr_payload);
 
         try self.sendPacket(.enr_response, enr_payload, src);
-        std.log.debug("Sent ENR response", .{});
+        std.log.debug("Sent ENR response with seq={}", .{enr.seq});
     }
 
     /// Handle ENR response packet
@@ -743,11 +742,72 @@ pub const UDPv4 = struct {
         var decoder = rlp.Decoder.init(payload);
         var list_decoder = try decoder.enterList();
 
-        const reply_token = try list_decoder.decodeBytesView();
-        _ = reply_token; // TODO: Match with pending request
+        _ = try list_decoder.decodeBytesView(); // reply_token
+        const enr_data = try list_decoder.decodeBytesView();
+
+        // Decode ENR (basic parsing)
+        var enr_decoder = rlp.Decoder.init(enr_data);
+        var enr_list = try enr_decoder.enterList();
+
+        const signature = try enr_list.decodeBytesView();
+        const seq = try enr_list.decodeInt();
+
+        std.log.debug("Received ENR response: seq={} sig_len={}", .{ seq, signature.len });
 
         self.metrics.enr_responses_received += 1;
-        std.log.debug("Received ENR response", .{});
+    }
+
+    /// Build our ENR (Ethereum Node Record)
+    fn buildENR(self: *Self) !struct { seq: u64, encoded: []u8 } {
+        // ENR format: [signature, seq, k1, v1, k2, v2, ...]
+        // Keys must be in lexicographic order
+        const seq: u64 = 1; // Increment when record changes
+
+        var encoder = rlp.Encoder.init(self.allocator);
+        defer encoder.deinit();
+
+        try encoder.startList();
+
+        // Placeholder signature (64 bytes) - should be secp256k1 signature
+        const placeholder_sig = [_]u8{0} ** 64;
+        try encoder.writeBytes(&placeholder_sig);
+
+        // Sequence number
+        try encoder.writeInt(seq);
+
+        // id: identity scheme (v4)
+        try encoder.writeBytes("id");
+        try encoder.writeBytes("v4");
+
+        // ip: IPv4 address
+        try encoder.writeBytes("ip");
+        const ip_bytes = switch (self.local_node.ip.any.family) {
+            std.posix.AF.INET => blk: {
+                const addr = self.local_node.ip.in.sa.addr;
+                break :blk std.mem.asBytes(&addr);
+            },
+            else => return error.UnsupportedAddressFamily,
+        };
+        try encoder.writeBytes(ip_bytes);
+
+        // secp256k1: public key (compressed, 33 bytes)
+        try encoder.writeBytes("secp256k1");
+        // In production, use actual compressed public key
+        const placeholder_pubkey = [_]u8{0x02} ++ ([_]u8{0} ** 32);
+        try encoder.writeBytes(&placeholder_pubkey);
+
+        // tcp: TCP port
+        try encoder.writeBytes("tcp");
+        try encoder.writeInt(self.local_node.tcp_port);
+
+        // udp: UDP port
+        try encoder.writeBytes("udp");
+        try encoder.writeInt(self.local_node.udp_port);
+
+        try encoder.endList();
+
+        const encoded = try encoder.toOwnedSlice();
+        return .{ .seq = seq, .encoded = encoded };
     }
 
     /// Revalidation loop - periodically check node liveness
@@ -928,11 +988,11 @@ pub const UDPv4 = struct {
             const ip_addr = if (ip_bytes.len == 4) blk: {
                 var addr_bytes: [4]u8 = undefined;
                 @memcpy(&addr_bytes, ip_bytes[0..4]);
-                break :blk try std.net.Address.initIp4(addr_bytes, 0);
+                break :blk std.net.Address.initIp4(addr_bytes, 0);
             } else blk: {
                 var addr_bytes: [16]u8 = undefined;
                 @memcpy(&addr_bytes, ip_bytes[0..16]);
-                break :blk try std.net.Address.initIp6(addr_bytes, 0, 0, 0);
+                break :blk std.net.Address.initIp6(addr_bytes, 0, 0, 0);
             };
 
             const udp_port: u16 = @intCast(try node_list.decodeInt());

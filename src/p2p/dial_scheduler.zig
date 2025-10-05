@@ -217,8 +217,12 @@ pub const DialScheduler = struct {
         if (self.running.load(.monotonic)) return error.AlreadyRunning;
         self.running.store(true, .monotonic);
 
+        // Allocate and copy iterator
+        const iter_ptr = try self.allocator.create(NodeIterator);
+        iter_ptr.* = node_iterator;
+
         // Start reader thread
-        self.reader_thread = try std.Thread.spawn(.{}, readNodesLoop, .{ self, node_iterator });
+        self.reader_thread = try std.Thread.spawn(.{}, readNodesLoop, .{ self, iter_ptr });
 
         // Start main loop thread
         self.main_thread = try std.Thread.spawn(.{}, mainLoop, .{self});
@@ -530,7 +534,7 @@ pub const DialScheduler = struct {
     fn dialTask(self: *Self, task: *DialTask) void {
         defer self.done_ch.send(task) catch {};
 
-        std.log.debug("Dialing peer at {}", .{task.dest.ip});
+        std.log.debug("Dialing peer at {any}", .{task.dest.ip});
 
         // Call setup function if provided (like Erigon's setupFunc)
         if (self.config.setup_func) |setup_func| {

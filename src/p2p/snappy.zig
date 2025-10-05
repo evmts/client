@@ -172,8 +172,8 @@ fn runDecode(dst: []u8, src: []const u8) u8 {
                     return 1;
                 }
 
-                mem.copy(u8, dst[d..], src[s .. s + @as(usize, @intCast(length))]);
                 const l = @as(usize, @intCast(length));
+                @memcpy(dst[d..][0..l], src[s .. s + l]);
                 d += l;
                 s += l;
                 continue;
@@ -216,9 +216,11 @@ fn runDecode(dst: []u8, src: []const u8) u8 {
         }
 
         if (offset >= length) {
-            const upper_bound = d - @as(usize, @intCast(offset)) + @as(usize, @intCast(length));
-            mem.copy(u8, dst[d .. d + @as(usize, @intCast(length))], dst[d - @as(usize, @intCast(offset)) .. upper_bound]);
-            d += @as(usize, @intCast(length));
+            const len = @as(usize, @intCast(length));
+            const off = @as(usize, @intCast(offset));
+            const upper_bound = d - off + len;
+            @memcpy(dst[d .. d + len], dst[d - off .. upper_bound]);
+            d += len;
             continue;
         }
 
@@ -278,7 +280,7 @@ fn emitLiteral(dst: []u8, lit: []const u8) usize {
             i = 3;
         },
     }
-    mem.copy(u8, dst[i..], lit);
+    @memcpy(dst[i..][0..lit.len], lit);
 
     return i + @min(dst.len, lit.len);
 }
@@ -425,7 +427,7 @@ pub fn encode(allocator: Allocator, src: []u8) ![]u8 {
 
     while (mutSrc.len > 0) {
         var p = try allocator.alloc(u8, mutSrc.len);
-        mem.copy(u8, p, mutSrc);
+        @memcpy(p, mutSrc);
         var empty = [_]u8{};
         mutSrc = empty[0..];
         if (p.len > maxBlockSize) {
@@ -441,7 +443,7 @@ pub fn encode(allocator: Allocator, src: []u8) ![]u8 {
     }
 
     const output = try allocator.alloc(u8, d);
-    mem.copy(u8, output, dst[0..d]);
+    @memcpy(output, dst[0..d]);
     allocator.free(dst);
 
     return output;

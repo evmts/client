@@ -64,7 +64,7 @@ pub fn execute(ctx: *sync.StageContext) !sync.StageResult {
         };
 
         // Generate and verify body
-        const body = try generateAndVerifyBody(ctx.allocator, &header);
+        var body = try generateAndVerifyBody(ctx.allocator, &header);
         errdefer body.deinit(ctx.allocator);
 
         try ctx.db.putBody(block_num, body);

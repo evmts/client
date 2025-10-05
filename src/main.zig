@@ -137,7 +137,7 @@ pub fn main() !void {
     // Main event loop - keep running until shutdown requested
     while (!shutdown_requested.load(.acquire)) {
         // Sleep briefly to avoid busy-waiting
-        std.time.sleep(100 * std.time.ns_per_ms);
+        std.Thread.sleep(100 * std.time.ns_per_ms);
 
         // In a full implementation, this loop would:
         // 1. Process background tasks

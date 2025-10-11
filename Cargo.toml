@@ -1,0 +1,6 @@
+[package]
+name = "client-rs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
